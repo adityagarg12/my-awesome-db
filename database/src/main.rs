@@ -11,10 +11,12 @@ use crate::{
     io_setup::{setup_disk_io, setup_monitor_io},
 };
 
+mod block_codec;
 mod catalog;
 mod cli;
 mod disk_access;
 mod io_setup;
+mod row;
 
 fn db_main() -> Result<()> {
     let cli_options = CliOptions::parse();
