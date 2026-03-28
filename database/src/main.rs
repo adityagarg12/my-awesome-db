@@ -5,11 +5,13 @@ use db_config::DbContext;
 use std::io::{BufRead, BufReader, Write};
 
 use crate::{
+    catalog::Catalog,
     cli::CliOptions,
     disk_access::DiskAccessLayer,
     io_setup::{setup_disk_io, setup_monitor_io},
 };
 
+mod catalog;
 mod cli;
 mod disk_access;
 mod io_setup;
@@ -17,18 +19,25 @@ mod io_setup;
 fn db_main() -> Result<()> {
     let cli_options = CliOptions::parse();
 
-    // Use the ctx to the tables and stats
+    // Build metadata layer (table/column/type lookup) from db config
     let ctx = DbContext::load_from_file(cli_options.get_config_path())?;
-    for table_spec in ctx.get_table_specs() {
-        println!("Table: {}", table_spec.name);
-        println!("File id: {}", table_spec.file_id);
-        for column_spec in &table_spec.column_specs {
-            println!(
-                "\tColumn: {} ({:?})",
-                column_spec.column_name, column_spec.data_type
-            );
+    let catalog = Catalog::from_db_context(&ctx)?;
+
+    for table in catalog.tables() {
+        println!("Table: {}", table.name);
+        println!("File id: {}", table.file_id);
+        for column in table.columns() {
+            println!("\tColumn[{}]: {} ({:?})", column.index, column.name, column.data_type);
         }
         println!();
+    }
+
+    if let Some(nation_file_id) = catalog.get_file_id("nation") {
+        println!("Lookup example: file id for table nation is {}", nation_file_id);
+    }
+
+    if let Some(column_index) = catalog.get_column_index("nation", "n_name") {
+        println!("Lookup example: nation.n_name is at column index {}", column_index);
     }
 
     // Setups and provides handler to talk with disk and monitor
