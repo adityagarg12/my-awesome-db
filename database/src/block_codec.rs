@@ -1,6 +1,6 @@
 use anyhow::{Result, bail, Context};
 use crate::row::{Row, decode_row, encode_row};
-use crate::catalog::TableCatalog;
+use crate::catalog::ColumnCatalog;
 
 /// Decode a single block into a vector of rows.
 ///
@@ -9,7 +9,7 @@ use crate::catalog::TableCatalog;
 pub fn decode_block(
     block_bytes: &[u8],
     block_size: u64,
-    table: &TableCatalog,
+    columns: &[ColumnCatalog],
 ) -> Result<Vec<Row>> {
     if block_bytes.len() as u64 != block_size {
         bail!(
@@ -44,7 +44,7 @@ pub fn decode_block(
             );
         }
 
-        let row = decode_row(&block_bytes[..row_count_offset], &mut offset, table.columns())
+        let row = decode_row(&block_bytes[..row_count_offset], &mut offset, columns)
             .context(format!("Failed to decode row {}", i))?;
 
         rows.push(row);
@@ -61,7 +61,7 @@ pub fn decode_block(
 pub fn encode_rows_to_blocks(
     rows: &[Row],
     block_size: u64,
-    table: &TableCatalog,
+    columns: &[ColumnCatalog],
 ) -> Result<Vec<u8>> {
     let usable_space = block_size as usize - 2;
 
@@ -76,7 +76,7 @@ pub fn encode_rows_to_blocks(
 
     for row in rows {
         let encoded_row =
-            encode_row(row, table.columns()).context("Failed to encode row")?;
+            encode_row(row, columns).context("Failed to encode row")?;
 
         // Check if row fits in current block's usable space
         if current_offset + encoded_row.len() > usable_space {

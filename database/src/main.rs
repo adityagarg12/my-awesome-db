@@ -3,90 +3,81 @@ use clap::Parser;
 use common::query::Query;
 use db_config::DbContext;
 use std::io::{BufRead, BufReader, Write};
+use std::sync::{Arc, Mutex};
 
 use crate::{
     catalog::Catalog,
     cli::CliOptions,
     disk_access::DiskAccessLayer,
+    executor::{AnonBlockAllocator, build_operator},
     io_setup::{setup_disk_io, setup_monitor_io},
+    row::format_row_for_output,
 };
 
 mod block_codec;
 mod catalog;
 mod cli;
 mod disk_access;
+mod executor;
 mod io_setup;
 mod row;
 
 fn db_main() -> Result<()> {
     let cli_options = CliOptions::parse();
 
-    // Build metadata layer (table/column/type lookup) from db config
     let ctx = DbContext::load_from_file(cli_options.get_config_path())?;
     let catalog = Catalog::from_db_context(&ctx)?;
 
-    for table in catalog.tables() {
-        println!("Table: {}", table.name);
-        println!("File id: {}", table.file_id);
-        for column in table.columns() {
-            println!("\tColumn[{}]: {} ({:?})", column.index, column.name, column.data_type);
-        }
-        println!();
-    }
-
-    if let Some(nation_file_id) = catalog.get_file_id("nation") {
-        println!("Lookup example: file id for table nation is {}", nation_file_id);
-    }
-
-    if let Some(column_index) = catalog.get_column_index("nation", "n_name") {
-        println!("Lookup example: nation.n_name is at column index {}", column_index);
-    }
-
-    // Setups and provides handler to talk with disk and monitor
     let (disk_in, disk_out) = setup_disk_io();
     let (monitor_in, mut monitor_out) = setup_monitor_io();
-    let mut disk_access_layer = DiskAccessLayer::new(disk_in, disk_out);
 
-    // Use buffered reader to read lines easier
-    let mut monitor_buf_reader = BufReader::new(monitor_in);
+    let disk_access = Arc::new(Mutex::new(DiskAccessLayer::new(disk_in, disk_out)));
+    let mut monitor_reader = BufReader::new(monitor_in);
+    let mut line = String::new();
 
-    // Temporary variable to read a line of input
-    let mut input_line = String::new();
+    // 1. Receive query
+    monitor_reader.read_line(&mut line)?;
+    let query: Query = serde_json::from_str(line.trim())
+        .context("Failed to parse query JSON")?;
 
-    // Read query form monitor
-    monitor_buf_reader.read_line(&mut input_line)?;
-    let query: Query = serde_json::from_str(&input_line).unwrap();
-    println!("Input query is: {:#?}", query);
-
-    // Interacting with with Disk
-
-    let block_size = disk_access_layer.get_block_size()?;
-
-    println!("block size is {}", block_size);
-
-    let buf = disk_access_layer.read_blocks(0, 1)?;
-    let preview_len = (buf.len()).min(50);
-
-    println!(
-        "First few bytes of block 0 contains {:?}",
-        String::from_utf8_lossy(&buf[..preview_len])
-    );
-
-    // Get memory limit from monitor
-    input_line.clear();
-    monitor_out.write_all("get_memory_limit\n".as_bytes())?;
+    // 2. Request memory limit
+    monitor_out.write_all(b"get_memory_limit\n")?;
     monitor_out.flush()?;
-    monitor_buf_reader.read_line(&mut input_line)?;
-    let memory_limit_mb: u32 = input_line.trim().parse()?;
-    println!("Memory limit is set to {} MB", memory_limit_mb);
+    line.clear();
+    monitor_reader.read_line(&mut line)?;
+    let memory_limit_mb: u64 = line.trim().parse().context("Failed to parse memory limit")?;
+    let memory_limit_bytes = memory_limit_mb * 1024 * 1024;
 
-    // Send result of query to monitor for validation
-    /*
-    monitor_out.write_all("validate\n".as_bytes())?;
-    monitor_out.write_all("1|hello|DBMS|\n".as_bytes())?;
-    monitor_out.write_all("!\n".as_bytes())?;
+    // 3. Get block size and anonymous-region start from disk
+    let block_size = {
+        let mut disk = disk_access.lock().unwrap();
+        disk.get_block_size()?
+    };
+    let anon_start = {
+        let mut disk = disk_access.lock().unwrap();
+        disk.get_anon_start_block()?
+    };
+    let anon_allocator = AnonBlockAllocator::new(anon_start);
+
+    // 4. Build operator tree
+    let mut root_op = build_operator(
+        &query.root,
+        &catalog,
+        disk_access,
+        block_size,
+        memory_limit_bytes,
+        &anon_allocator,
+    )?;
+
+    // 5. Stream results to monitor
+    monitor_out.write_all(b"validate\n")?;
+    while let Some(row) = root_op.next()? {
+        let mut out = format_row_for_output(&row);
+        out.push('\n');
+        monitor_out.write_all(out.as_bytes())?;
+    }
+    monitor_out.write_all(b"!\n")?;
     monitor_out.flush()?;
-    */
 
     Ok(())
 }

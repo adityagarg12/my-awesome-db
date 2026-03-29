@@ -66,3 +66,120 @@ conda run -n myawesome_db_env rustc --version
 conda run -n myawesome_db_env cargo --version
 conda run -n myawesome_db_env sqlite3 --version
 ```
+
+---
+
+# Database Workflow: Export, Build, and Run
+
+This section covers the end-to-end workflow for exporting expected query results, building the database binary, and running validation tests.
+
+## Step 1: Export Expected Query Results from SQLite
+
+Generate expected output files for monitor validation using explicit formatting.
+
+### Create a SQL script (e.g., `q1.sql`)
+
+```sql
+.mode list
+.separator |
+.headers off
+SELECT n_nationkey, n_name, n_regionkey, n_comment, '' FROM nation;
+```
+
+**Important notes:**
+- `.mode list` sets output to list (pipe-delimited) format
+- `.separator |` explicitly sets the column separator to `|` (required for portability)
+- `.headers off` suppresses column headers
+- `''` (empty string column) adds a trailing `|` to each row, as required by the monitor
+
+### Run the export in the conda environment
+
+First activate the environment:
+
+```bash
+conda activate myawesome_db_env
+```
+
+Then run the export:
+
+```bash
+sqlite3 scratch/compiled_datasets/tpch/sqlite.db < q1.sql > scratch/runtimes/tpch/expected_1.csv
+```
+
+Verify the output format (should be pipe-delimited with trailing `|`):
+
+```bash
+head -5 scratch/runtimes/tpch/expected_1.csv
+```
+
+Expected output:
+```
+0|ALGERIA|0| haggle. carefully final deposits detect slyly agai|
+1|ARGENTINA|1|al foxes promise slyly according to the regular accounts. bold requests alon|
+...
+```
+
+## Step 2: Build the Project in Release Mode
+
+Compile all binaries (disk, database, monitor, generator) for optimal performance.
+
+First activate the environment:
+
+```bash
+conda activate myawesome_db_env
+```
+
+Then build:
+
+```bash
+cargo build -r
+```
+
+This creates release binaries in `target/release/`:
+- `database` — the query execution engine
+- `disk` — the disk simulator
+- `monitor` — the validation orchestrator
+- `generator` — dataset/config generation tool
+
+## Step 3: Run Monitor for Validation
+
+Execute a full test with the monitor, which orchestrates disk, database, and expected output comparison.
+
+First activate the environment:
+
+```bash
+conda activate myawesome_db_env
+```
+
+Then run the monitor:
+
+```bash
+cargo run -r --bin monitor -- --config scratch/runtimes/tpch/monitor_config.json
+```
+
+### Expected behavior
+
+The monitor will:
+1. Start the disk simulator with the disk config
+2. Launch the database with the database config and memory limit
+3. Send the query JSON to the database
+4. Stream the database output row-by-row to the monitor
+5. Compare each row with expected output
+6. Print success/failure
+
+### Success output
+
+```
+--------------------------------------------------------------------------------
+Validation success! for Simple Scan
+```
+
+### Debugging failed runs
+
+If validation fails:
+1. Check expected output format: `head scratch/runtimes/tpch/expected_1.csv`
+2. Verify pipe separator and trailing `|` are present
+3. Check database output directly (see [database/src/main.rs](database/src/main.rs))
+4. Ensure all queries use pipe-delimited format with trailing empty column
+
+---
