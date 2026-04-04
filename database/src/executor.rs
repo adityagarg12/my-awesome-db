@@ -6,7 +6,7 @@ use common::{Data, DataType};
 use common::query::{ComparisionValue, Predicate, QueryOp, SortSpec};
 use crate::catalog::{Catalog, ColumnCatalog, TableCatalog};
 use crate::disk_access::DiskAccessLayer;
-use crate::row::{Row, data_compare};
+use crate::row::{Row, data_compare, encode_row};
 use crate::block_codec::{decode_block, encode_rows_to_blocks};
 
 // ---------------------------------------------------------------------------
@@ -290,63 +290,257 @@ impl Operator for ProjectOperator {
 }
 
 // ---------------------------------------------------------------------------
-// CrossOperator  (nested-loop: buffer right, stream left)
+// CrossOperator  — Block Nested-Loop Join (B-NLJ)
+//
+// Phase 1  (init, one-time):
+//   Consume right child row-by-row; pack each row into a block-sized byte
+//   buffer and flush to anonymous disk when the buffer is full.
+//   At most one block of encoded bytes lives in RAM at any moment.
+//
+// Phase 2  (next, B-NLJ proper):
+//   outer  : left_chunk  — fill RAM with as many left rows as the memory
+//            budget allows; re-fill from the left child when exhausted.
+//   middle : right_blocks — for each left_chunk, scan every right block
+//            from disk exactly once (1 block in RAM at a time).
+//   inner  : emit left_chunk[i] ⊗ right_block_row[j] for all i,j.
+//
+// Total right-disk reads = ceil(|left_rows| / left_chunk_capacity) × |right_blocks|
+// instead of |left_rows| × |right_blocks| if we looped per left row.
 // ---------------------------------------------------------------------------
 
-pub struct CrossOperator {
+pub struct CrossOperator<R: Read, W: Write> {
     left: Box<dyn Operator>,
-    right: Box<dyn Operator>,
-    right_rows: Vec<Row>,
-    left_current: Option<Row>,
-    right_idx: usize,
+    right: Option<Box<dyn Operator>>,   // consumed once during init
     schema: Schema,
+    disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
+    block_size: u64,
+    anon_allocator: AnonBlockAllocator,
+    right_cols: Vec<ColumnCatalog>,
+    memory_limit_bytes: u64,
+
+    // Populated after spill
     initialized: bool,
+    right_is_empty: bool,
+    right_start_block: u64,
+    right_num_blocks: u64,
+
+    // B-NLJ iteration state
+    left_chunk: Vec<Row>,           // buffered left rows for current outer pass
+    left_exhausted: bool,
+    right_block_offset: u64,        // which right block (0-based) we are scanning
+    right_block_rows: Vec<Row>,     // decoded rows from current right block
+    right_row_idx: usize,           // which row inside right_block_rows
+    left_chunk_idx: usize,          // which left_chunk row to pair with current right row
 }
 
-impl CrossOperator {
-    pub fn new(left: Box<dyn Operator>, right: Box<dyn Operator>) -> Self {
-        let schema = Schema::merge(left.schema(), right.schema());
+impl<R: Read, W: Write> CrossOperator<R, W> {
+    pub fn new(
+        left: Box<dyn Operator>,
+        right: Box<dyn Operator>,
+        disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
+        block_size: u64,
+        memory_limit_bytes: u64,
+        anon_allocator: AnonBlockAllocator,
+    ) -> Self {
+        let schema     = Schema::merge(left.schema(), right.schema());
+        let right_cols = right.schema().columns().to_vec();
         CrossOperator {
-            left, right,
-            right_rows: Vec::new(),
-            left_current: None,
-            right_idx: 0,
-            schema,
-            initialized: false,
+            left, right: Some(right), schema,
+            disk_access, block_size, anon_allocator, right_cols,
+            memory_limit_bytes,
+            initialized: false, right_is_empty: false,
+            right_start_block: 0, right_num_blocks: 0,
+            left_chunk: Vec::new(), left_exhausted: false,
+            right_block_offset: 0,
+            right_block_rows: Vec::new(),
+            right_row_idx: 0, left_chunk_idx: 0,
         }
+    }
+
+    /// Estimate in-memory size of one left row (same logic as SortOperator).
+    fn left_row_size(&self) -> usize {
+        let mut s = 24usize;
+        for col in self.left.schema().columns() {
+            s += match col.data_type { DataType::String => 64, _ => 32 };
+        }
+        s
+    }
+
+    /// How many left rows to buffer per chunk.
+    ///
+    /// Unlike SortOperator there is no double-allocation proportional to
+    /// chunk size: the right spill uses a fixed block_buf (~4 KB) that is
+    /// freed before B-NLJ begins, and the B-NLJ phase only holds the left
+    /// chunk + one decoded right block simultaneously.
+    ///
+    /// Process overhead (release binary ~12 MB, debug ~14 MB):
+    ///   text + data      : ~1.2 MB release / 2.7 MB debug
+    ///   shared libs      : ~2.5 MB (libc, libgcc)
+    ///   stack reservation: ~8 MB  (Linux default)
+    ///   heap metadata    : ~0.5 MB
+    ///   right block buf  : 4 × block_size (~16 KB, negligible)
+    ///
+    /// Reserve 16 MB for all overhead; give everything else to the left chunk.
+    /// 64 MB limit  → 48 MB available (75 %)
+    /// 256 MB limit → 240 MB available (94 %)
+    /// 
+    fn left_chunk_capacity(&self) -> usize {
+        // TO BE CHECK , we can adjust the PROCESS_OVERHEAD estimate if needed based on actual measurements, which came around 14mb at startup in debug mode and 12mb in release mode. We want to be conservative to avoid OOM, but not too much to underutilize memory.
+        const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024; // 32 MB
+        let right_buf = self.block_size * 4;
+        let available = self.memory_limit_bytes
+            .saturating_sub(PROCESS_OVERHEAD)
+            .saturating_sub(right_buf);
+        (available as usize / self.left_row_size()).max(64)
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 1: spill right to anonymous disk, one block at a time
+    // ------------------------------------------------------------------
+    fn spill_right(&mut self) -> Result<()> {
+        let mut right_child = self.right.take().unwrap();
+        let usable = self.block_size as usize - 2;
+
+        let mut block_buf      = vec![0u8; self.block_size as usize];
+        let mut buf_offset     = 0usize;
+        let mut rows_in_block  = 0u16;
+        let mut total_blocks   = 0u64;
+        let mut first_block    = 0u64;
+        let mut got_first      = false;
+        let mut has_any_row    = false;
+
+        while let Some(row) = right_child.next()? {
+            has_any_row = true;
+            let encoded = encode_row(&row, &self.right_cols)?;
+            if encoded.len() > usable {
+                anyhow::bail!(
+                    "CrossOperator: right row ({} B) larger than usable block space ({} B)",
+                    encoded.len(), usable
+                );
+            }
+
+            if buf_offset + encoded.len() > usable {
+                // Flush current block to disk
+                let footer = block_buf.len() - 2;
+                block_buf[footer..].copy_from_slice(&rows_in_block.to_le_bytes());
+                let id = self.anon_allocator.allocate(1);
+                if !got_first { first_block = id; got_first = true; }
+                self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
+                total_blocks += 1;
+                block_buf.fill(0); buf_offset = 0; rows_in_block = 0;
+            }
+
+            block_buf[buf_offset..buf_offset + encoded.len()].copy_from_slice(&encoded);
+            buf_offset    += encoded.len();
+            rows_in_block += 1;
+        }
+
+        if !has_any_row {
+            self.right_is_empty = true;
+            return Ok(());
+        }
+
+        // Flush the final (possibly partial) block
+        let footer = block_buf.len() - 2;
+        block_buf[footer..].copy_from_slice(&rows_in_block.to_le_bytes());
+        let id = self.anon_allocator.allocate(1);
+        if !got_first { first_block = id; }
+        self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
+        total_blocks += 1;
+
+        self.right_start_block = first_block;
+        self.right_num_blocks  = total_blocks;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2 helpers
+    // ------------------------------------------------------------------
+
+    /// Fill left_chunk with up to left_chunk_capacity rows from the left child.
+    fn fill_left_chunk(&mut self) -> Result<()> {
+        self.left_chunk.clear();
+        let cap = self.left_chunk_capacity();
+        while self.left_chunk.len() < cap {
+            match self.left.next()? {
+                Some(row) => self.left_chunk.push(row),
+                None      => { self.left_exhausted = true; break; }
+            }
+        }
+        Ok(())
+    }
+
+    /// Load right block at `offset` into right_block_rows; reset right_row_idx.
+    fn load_right_block(&mut self, offset: u64) -> Result<()> {
+        let id   = self.right_start_block + offset;
+        let data = { self.disk_access.lock().unwrap().read_blocks(id, 1)? };
+        self.right_block_rows = decode_block(&data, self.block_size, &self.right_cols)?;
+        self.right_row_idx    = 0;
+        Ok(())
+    }
+
+    fn initialize(&mut self) -> Result<()> {
+        self.spill_right()?;
+        if !self.right_is_empty {
+            // Load first left chunk and first right block
+            self.fill_left_chunk()?;
+            if !self.left_chunk.is_empty() {
+                self.left_chunk_idx    = 0;
+                self.right_block_offset = 0;
+                self.load_right_block(0)?;
+            }
+        }
+        self.initialized = true;
+        Ok(())
     }
 }
 
-impl Operator for CrossOperator {
+impl<R: Read, W: Write> Operator for CrossOperator<R, W> {
     fn schema(&self) -> &Schema { &self.schema }
 
     fn next(&mut self) -> Result<Option<Row>> {
         if !self.initialized {
-            while let Some(row) = self.right.next()? {
-                self.right_rows.push(row);
-            }
-            self.left_current = self.left.next()?;
-            self.right_idx = 0;
-            self.initialized = true;
+            self.initialize()?;
+        }
+
+        if self.right_is_empty || self.left_chunk.is_empty() {
+            return Ok(None);
         }
 
         loop {
-            let left_row = match &self.left_current {
-                None    => return Ok(None),
-                Some(r) => r.clone(),
-            };
-
-            if self.right_idx < self.right_rows.len() {
-                let right_row = self.right_rows[self.right_idx].clone();
-                self.right_idx += 1;
-                let mut values = left_row.values().to_vec();
-                values.extend_from_slice(right_row.values());
-                return Ok(Some(Row::new(values)));
+            // --- inner loop: pair current right row with remaining left_chunk rows ---
+            if self.right_row_idx < self.right_block_rows.len() {
+                if self.left_chunk_idx < self.left_chunk.len() {
+                    let left_row  = &self.left_chunk[self.left_chunk_idx];
+                    let right_row = &self.right_block_rows[self.right_row_idx];
+                    let mut values = left_row.values().to_vec();
+                    values.extend_from_slice(right_row.values());
+                    self.left_chunk_idx += 1;
+                    return Ok(Some(Row::new(values)));
+                }
+                // All left_chunk rows paired with this right row → advance right row
+                self.left_chunk_idx = 0;
+                self.right_row_idx += 1;
+                continue;
             }
 
-            // Advance left row
-            self.right_idx = 0;
-            self.left_current = self.left.next()?;
+            // --- right block exhausted: move to next right block ---
+            self.right_block_offset += 1;
+            if self.right_block_offset < self.right_num_blocks {
+                self.load_right_block(self.right_block_offset)?;
+                self.left_chunk_idx = 0;
+                continue;
+            }
+
+            // --- all right blocks done for this left chunk: load next left chunk ---
+            self.fill_left_chunk()?;
+            if self.left_chunk.is_empty() {
+                return Ok(None); // left fully exhausted
+            }
+            // Reset right scan for the new left chunk
+            self.right_block_offset = 0;
+            self.load_right_block(0)?;
+            self.left_chunk_idx = 0;
         }
     }
 }
@@ -647,8 +841,8 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
 
         QueryOp::Cross(d) => {
             let left  = build_operator(&d.left,  catalog, disk_access.clone(), block_size, memory_limit_bytes, anon_allocator)?;
-            let right = build_operator(&d.right, catalog, disk_access,         block_size, memory_limit_bytes, anon_allocator)?;
-            Ok(Box::new(CrossOperator::new(left, right)))
+            let right = build_operator(&d.right, catalog, disk_access.clone(), block_size, memory_limit_bytes, anon_allocator)?;
+            Ok(Box::new(CrossOperator::new(left, right, disk_access, block_size, memory_limit_bytes, anon_allocator.clone())))
         }
     }
 }
