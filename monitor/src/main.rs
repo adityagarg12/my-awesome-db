@@ -102,7 +102,68 @@ fn setup_db_process(
     Ok((db_process_child, db_to_monitor_reader, monitor_to_db_writer))
 }
 
-fn validate(db_in: &mut impl BufRead, expected_output_file_path: &PathBuf) -> Result<()> {
+fn validate_bysorting(db_in: &mut impl BufRead, expected_output_file_path: &PathBuf) -> Result<()> {
+    let mut expected_output_reader = BufReader::new(File::open(expected_output_file_path)?);
+    let mut expected_rows = Vec::new();
+    loop {
+        let mut row = String::new();
+        expected_output_reader
+            .read_line(&mut row)
+            .context("Failed to read row from expected output file")?;
+        let trimmed_row = row.trim();
+        if trimmed_row.len() == 0 {
+            break;
+        }
+        expected_rows.push(trimmed_row.to_string());
+    }
+
+    let mut db_output_rows = Vec::new();
+
+    loop {
+        let mut db_in_line = String::new();
+        db_in
+            .read_line(&mut db_in_line)
+            .context("Failed to read line from database output")?;
+
+        if db_in_line.trim() == "!" {
+            if db_output_rows.len() != expected_rows.len() {
+                bail!(
+                    "Number of rows didn't match, expected {} but found {}",
+                    expected_rows.len(),
+                    db_output_rows.len()
+                );
+            }
+            break;
+        }
+        if db_output_rows.len() == expected_rows.len() {
+            bail!(
+                "Expected end of row `!`, but db outputed additional row {}",
+                db_in_line
+            );
+        }
+        if db_in_line.trim().len() == 0 {
+            bail!("Empty line found");
+        }
+        db_output_rows.push(db_in_line.trim().to_string());
+    }
+
+    expected_rows.sort();
+    db_output_rows.sort();
+
+    for (expected_row, db_row) in expected_rows.iter().zip(db_output_rows.iter()) {
+        if !expected_row.eq(db_row) {
+            bail!(
+                "Expected line output\n{}\nbut database returned\n{}",
+                expected_row,
+                db_row
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_presorted(db_in: &mut impl BufRead, expected_output_file_path: &PathBuf) -> Result<()> {
     let mut expected_output_reader = BufReader::new(File::open(expected_output_file_path)?);
     let mut line_count = 0;
 
@@ -155,7 +216,10 @@ fn handle_db(
                 db_out.write_all(format!("{}\n", query_config.memory_limit_mb).as_bytes())?;
             }
             "validate" => {
-                validate(db_in, &query_config.expected_output_file)?;
+                match query_config.sort_before_check {
+                    true => validate_bysorting(db_in, &query_config.expected_output_file),
+                    false => validate_presorted(db_in, &query_config.expected_output_file),
+                }?;
                 return Ok(());
             }
             other => bail!("Unknown command: {other}"),
