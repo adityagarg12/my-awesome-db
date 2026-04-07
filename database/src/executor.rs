@@ -707,10 +707,129 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         }).collect()
     }
 
+    /// Max number of runs we can merge simultaneously without exceeding the
+    /// memory budget.
+    ///
+    /// During a merge pass each RunReader holds one block's worth of decoded
+    /// rows in RAM (`current_rows`). The HeapEntry for each run adds one
+    /// key clone (small). One additional block_size buffer is needed
+    /// transiently when loading the next block (shared, not per-run).
+    ///
+    ///   per_run  ≈  block_size          (decoded rows ≈ one encoded block)
+    ///            +  sort_specs.len() × 48  (HeapEntry.key)
+    ///   fan_in   =  (available − block_size) / per_run
+    /// 
+    fn merge_fan_in(&self) -> usize {
+        // to be check
+        const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
+        let available = self.memory_limit_bytes
+            .saturating_sub(PROCESS_OVERHEAD)
+            .saturating_sub(self.block_size) as usize;
+        //TO BE CHECK
+        let key_size  = 24 + self.sort_specs.len() * 40; // Vec header (24) + (Data,bool) per col (40)
+        let per_run   = self.block_size as usize + key_size;
+        (available / per_run.max(1)).max(2)
+    }
+
+    /// Merge `run_specs` sorted runs into one new sorted run written to
+    /// anonymous disk. Returns (start_block, num_blocks) of the output run.
+    ///
+    /// Streams row-by-row via the k-way heap — at most one block per input
+    /// run is decoded at any time, plus one output block buffer.
+    fn merge_runs_to_disk(&self, run_specs: &[(u64, u64)]) -> Result<(u64, u64)> {
+        let cols = self.schema.columns().to_vec();
+
+        let mut readers: Vec<RunReader<R, W>> = run_specs.iter()
+            .map(|&(start, n)| RunReader::new(
+                self.disk_access.clone(), cols.clone(), self.block_size, start, n,
+            ))
+            .collect();
+
+        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
+        for (i, reader) in readers.iter_mut().enumerate() {
+            if let Some(row) = reader.next_row()? {
+                let key = self.make_heap_key(&row);
+                heap.push(HeapEntry { key, row, run_idx: i });
+            }
+        }
+
+        let usable          = self.block_size as usize - 2;
+        let mut block_buf   = vec![0u8; self.block_size as usize];
+        let mut buf_offset  = 0usize;
+        let mut rows_in_blk = 0u16;
+        let mut total_blks  = 0u64;
+        let mut first_blk   = 0u64;
+        let mut got_first   = false;
+
+        while let Some(entry) = heap.pop() {
+            let run_idx = entry.run_idx;
+            if let Some(next_row) = readers[run_idx].next_row()? {
+                let key = self.make_heap_key(&next_row);
+                heap.push(HeapEntry { key, row: next_row, run_idx });
+            }
+
+            let encoded = encode_row(&entry.row, &cols)?;
+            if encoded.len() > usable {
+                anyhow::bail!(
+                    "SortOperator: row ({} B) exceeds usable block space ({} B)",
+                    encoded.len(), usable
+                );
+            }
+
+            if buf_offset + encoded.len() > usable {
+                // Flush full block
+                let footer = block_buf.len() - 2;
+                block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
+                let id = self.anon_allocator.allocate(1);
+                if !got_first { first_blk = id; got_first = true; }
+                self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
+                total_blks += 1;
+                block_buf.fill(0); buf_offset = 0; rows_in_blk = 0;
+            }
+
+            block_buf[buf_offset..buf_offset + encoded.len()].copy_from_slice(&encoded);
+            buf_offset  += encoded.len();
+            rows_in_blk += 1;
+        }
+
+        // Flush final (possibly partial) block
+        if rows_in_blk > 0 {
+            let footer = block_buf.len() - 2;
+            block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
+            let id = self.anon_allocator.allocate(1);
+            if !got_first { first_blk = id; }
+            self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
+            total_blks += 1;
+        }
+
+        Ok((first_blk, total_blks))
+    }
+
+    /// Prime the final streaming merge heap from `self.run_readers`.
+    fn prime_merge_heap(&mut self) -> Result<()> {
+        for run_idx in 0..self.run_readers.len() {
+            if let Some(row) = self.run_readers[run_idx].next_row()? {
+                let key = self.make_heap_key(&row);
+                self.merge_heap.push(HeapEntry { key, row, run_idx });
+            }
+        }
+        Ok(())
+    }
+
     fn initialize(&mut self) -> Result<()> {
         let row_size = self.row_mem_estimate();
-        // Use 40% of the memory budget for one sorting chunk
-        let chunk_capacity = ((self.memory_limit_bytes as usize * 40 / 100) / row_size).max(128);
+        // Use 40% of the memory budget for one sorting chunk.
+        // The 40% accounts for encode_rows_to_blocks allocating a second Vec<u8>
+        // of similar size simultaneously during write_run (2 × 40% = 80% peak).
+        let budget = self.memory_limit_bytes as usize * 40 / 100;
+        if budget < row_size {
+            anyhow::bail!(
+                "SortOperator: memory limit ({} bytes) too small to hold even one row (~{} bytes estimated)",
+                self.memory_limit_bytes,
+                row_size
+            );
+        }
+        let chunk_capacity = (budget / row_size).max(1);
 
         let mut child = self.child.take().unwrap();
         let mut chunk: Vec<Row> = Vec::with_capacity(chunk_capacity);
@@ -731,29 +850,42 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         }
 
         if runs.is_empty() {
-            // Everything fit in one chunk → pure in-memory sort
+            // Everything fit in one chunk — pure in-memory sort, no disk needed
             Self::sort_slice(&mut chunk, &self.sort_specs, &self.schema);
             self.in_memory_rows = chunk;
         } else {
-            // Write the tail chunk (if non-empty) as the last run
+            // Flush the tail chunk as the last run (if non-empty)
             if !chunk.is_empty() {
                 Self::sort_slice(&mut chunk, &self.sort_specs, &self.schema);
                 runs.push(self.write_run(&chunk)?);
             }
+            drop(chunk); // free before merge
 
-            // Set up RunReaders and prime the merge heap
+            // Multi-pass merge: reduce runs until fan_in allows a single pass
+            let fan_in = self.merge_fan_in();
+            if fan_in < 2 {
+                anyhow::bail!(
+                    "SortOperator: memory limit ({} bytes) too small to merge even 2 runs",
+                    self.memory_limit_bytes
+                );
+            }
+
+            while runs.len() > fan_in {
+                let mut merged = Vec::with_capacity((runs.len() + fan_in - 1) / fan_in);
+                for batch in runs.chunks(fan_in) {
+                    merged.push(self.merge_runs_to_disk(batch)?);
+                }
+                runs = merged;
+            }
+
+            // Final pass: set up streaming k-way merge via BinaryHeap
             let cols = self.schema.columns().to_vec();
             for (start, n) in runs {
                 self.run_readers.push(RunReader::new(
                     self.disk_access.clone(), cols.clone(), self.block_size, start, n,
                 ));
             }
-            for run_idx in 0..self.run_readers.len() {
-                if let Some(row) = self.run_readers[run_idx].next_row()? {
-                    let key = self.make_heap_key(&row);
-                    self.merge_heap.push(HeapEntry { key, row, run_idx });
-                }
-            }
+            self.prime_merge_heap()?;
         }
 
         self.initialized = true;
