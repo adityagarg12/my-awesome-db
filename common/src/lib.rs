@@ -11,7 +11,7 @@ pub enum Data {
     String(String),
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub enum DataType {
     Int32,
     Int64,

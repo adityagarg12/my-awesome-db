@@ -23,12 +23,31 @@ mod fd_mapper;
 
 const MAX_COMMAND_LENGTH: u64 = 1024;
 
+fn is_debug_enabled() -> bool {
+    matches!(
+        std::env::var("MONITOR_DEBUG").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+fn debug_log(message: &str) {
+    if is_debug_enabled() {
+        eprintln!("[monitor-debug] {message}");
+    }
+}
+
 fn setup_disk_process(monitor_config: &MonitorConfig) -> Result<(Child, PipeReader, PipeWriter)> {
     let (disk_outbound_reader, disk_outbound_writer) = pipe()?;
     let (disk_inbound_reader, disk_inbound_writer) = pipe()?;
 
     let disk_prog = &monitor_config.get_disk_config().disk_prog;
     let disk_prog_config = &monitor_config.get_disk_config().disk_prog_config;
+
+    debug_log(&format!(
+        "spawning disk process: {} --config {}",
+        disk_prog.to_string_lossy(),
+        disk_prog_config.to_string_lossy()
+    ));
 
     // Start disk program
     let disk_process = Command::new(disk_prog)
@@ -52,6 +71,12 @@ fn setup_db_process(
 
     let db_prog = &database_config.database_prog;
     let db_prog_config = &database_config.database_prog_config;
+
+    debug_log(&format!(
+        "spawning db process: {} --config {}",
+        db_prog.to_string_lossy(),
+        db_prog_config.to_string_lossy()
+    ));
 
     // Setup database program
     let mut db_process = Command::new(db_prog);
@@ -103,6 +128,10 @@ fn setup_db_process(
 }
 
 fn validate_bysorting(db_in: &mut impl BufRead, expected_output_file_path: &PathBuf) -> Result<()> {
+    debug_log(&format!(
+        "validate_bysorting using expected file {}",
+        expected_output_file_path.to_string_lossy()
+    ));
     let mut expected_output_reader = BufReader::new(File::open(expected_output_file_path)?);
     let mut expected_rows = Vec::new();
     loop {
@@ -164,6 +193,10 @@ fn validate_bysorting(db_in: &mut impl BufRead, expected_output_file_path: &Path
 }
 
 fn validate_presorted(db_in: &mut impl BufRead, expected_output_file_path: &PathBuf) -> Result<()> {
+    debug_log(&format!(
+        "validate_presorted using expected file {}",
+        expected_output_file_path.to_string_lossy()
+    ));
     let mut expected_output_reader = BufReader::new(File::open(expected_output_file_path)?);
     let mut line_count = 0;
 
@@ -202,6 +235,7 @@ fn handle_db(
     query_config: &QueryConfig,
 ) -> Result<()> {
     // Write provide the query to db
+    debug_log("sending query JSON to database process");
     db_out.write_all(format!("{}\n", serde_json::to_string(&query_config.query)?).as_bytes())?;
     db_out.flush()?;
 
@@ -213,9 +247,11 @@ fn handle_db(
 
         match command[0].to_lowercase().as_ref() {
             "get_memory_limit" => {
+                debug_log("database requested memory limit");
                 db_out.write_all(format!("{}\n", query_config.memory_limit_mb).as_bytes())?;
             }
             "validate" => {
+                debug_log("database requested validation");
                 match query_config.sort_before_check {
                     true => validate_bysorting(db_in, &query_config.expected_output_file),
                     false => validate_presorted(db_in, &query_config.expected_output_file),
@@ -239,6 +275,13 @@ fn read_command<R: BufRead>(buf_reader: &mut R) -> Result<Vec<String>> {
 
         let result: Vec<String> = input_line.split_whitespace().map(String::from).collect();
 
+        if is_debug_enabled() {
+            let printable = input_line.trim();
+            if !printable.is_empty() {
+                eprintln!("[monitor-debug] received command line: {printable}");
+            }
+        }
+
         if !result.is_empty() || read_length == 0 {
             return Ok(result);
         }
@@ -247,6 +290,10 @@ fn read_command<R: BufRead>(buf_reader: &mut R) -> Result<Vec<String>> {
 
 fn monitor_main() -> Result<()> {
     let cli_options = CliOptions::parse();
+    debug_log(&format!(
+        "loading monitor config {}",
+        cli_options.get_config_path().to_string_lossy()
+    ));
 
     let monitor_config = MonitorConfig::load_config(cli_options.get_config_path())
         .context("Failed to load monitor config")?;
@@ -255,6 +302,11 @@ fn monitor_main() -> Result<()> {
         if query_config.disabled {
             continue;
         }
+
+        debug_log(&format!(
+            "starting query: {}",
+            query_config.execution_name.replace('\n', " ")
+        ));
 
         let (mut disk_process, disk_outbound_reader, disk_inbound_writer) =
             setup_disk_process(&monitor_config)?;
@@ -268,13 +320,17 @@ fn monitor_main() -> Result<()> {
 
         let mut db_in = BufReader::new(db_outbound_reader);
         let db_result = handle_db(&mut db_in, &mut db_inbound_writer, &query_config);
+        debug_log("query execution returned from handle_db");
 
         if let Err(_) = &db_result {
+            debug_log("query failed, killing db process");
             db_process.kill()?;
         } else {
+            debug_log("query succeeded, waiting for db process exit");
             db_process.wait()?;
         }
 
+        debug_log("waiting for disk process exit");
         disk_process.wait()?;
 
         println!(
