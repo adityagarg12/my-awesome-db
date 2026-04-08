@@ -50,6 +50,26 @@ pub struct CrossData {
     pub right: Box<QueryOp>,
 }
 
+/// Which physical join algorithm to use for a Join node.
+/// Set by the optimizer; defaults to BNlj.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum JoinAlgorithm {
+    /// Block Nested-Loop Join — right side spilled to disk, left chunked in RAM.
+    BNlj,
+    /// Sort-Merge Join — both inputs must arrive pre-sorted on the join key.
+    SortMerge,
+}
+
+/// Optimizer-internal node: never appears in the input query tree.
+/// Produced by rewriting Filter(Cross(...)) when join predicates are found.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinData {
+    pub left: Box<QueryOp>,
+    pub right: Box<QueryOp>,
+    pub predicates: Vec<Predicate>,
+    pub algorithm: JoinAlgorithm,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SortSpec {
     pub column_name: String,
@@ -72,6 +92,9 @@ pub enum QueryOp {
     Cross(CrossData),
     Sort(SortData),
     Scan(ScanData),
+    /// Optimizer-internal: B-NLJ join with pushed-down predicates.
+    /// Never present in the input query; produced by the optimizer.
+    Join(JoinData),
 }
 
 impl QueryOp {

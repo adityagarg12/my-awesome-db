@@ -11,6 +11,7 @@ use crate::{
     disk_access::DiskAccessLayer,
     executor::{AnonBlockAllocator, build_operator},
     io_setup::{setup_disk_io, setup_monitor_io},
+    optimizer::optimize,
     row::format_row_for_output,
 };
 
@@ -20,6 +21,7 @@ mod cli;
 mod disk_access;
 mod executor;
 mod io_setup;
+mod optimizer;
 mod row;
 
 fn db_main() -> Result<()> {
@@ -59,9 +61,10 @@ fn db_main() -> Result<()> {
     };
     let anon_allocator = AnonBlockAllocator::new(anon_start);
 
-    // 4. Build operator tree
+    // 4. Optimize query tree, then build operator tree
+    let optimized = optimize(query.root, &catalog);
     let mut root_op = build_operator(
-        &query.root,
+        &optimized,
         &catalog,
         disk_access,
         block_size,

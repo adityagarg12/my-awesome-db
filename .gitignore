@@ -5,3 +5,4 @@
 **/*.schema
 **/*.bin
 **/*.sql
+*.gz
