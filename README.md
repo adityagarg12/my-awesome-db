@@ -127,14 +127,14 @@ Example: run only test #39.
 python3 - <<'PY'
 import json
 src = 'scratch/runtimes/tpch/monitor_config.json'
-dst = 'scratch/runtimes/tpch/monitor_config_test39.json'
+dst = 'scratch/runtimes/tpch/monitor_config_test52.json'
 with open(src) as f:
     cfg = json.load(f)
 for i, q in enumerate(cfg['query_configs'], start=1):
-    q['disabled'] = (i != 39)
+    q['disabled'] = (i != 52)
 with open(dst, 'w') as f:
     json.dump(cfg, f, indent=2)
-print('Enabled query #39:', cfg['query_configs'][38]['execution_name'])
+print('Enabled query #52:', cfg['query_configs'][51]['execution_name'])
 print('Wrote', dst)
 PY
 

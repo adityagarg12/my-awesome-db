@@ -3,24 +3,11 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use anyhow::{Result, anyhow};
 use common::{Data, DataType};
-use common::query::{ComparisionValue, Predicate, QueryOp, SortSpec};
+use common::query::{ComparisionOperator, ComparisionValue, JoinAlgorithm, JoinData, Predicate, QueryOp, SortSpec};
 use crate::catalog::{Catalog, ColumnCatalog, TableCatalog};
 use crate::disk_access::DiskAccessLayer;
 use crate::row::{Row, data_compare, encode_row};
 use crate::block_codec::{decode_block, encode_rows_to_blocks};
-
-fn is_debug_enabled() -> bool {
-    matches!(
-        std::env::var("DATABASE_DEBUG").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
-    )
-}
-
-fn debug_log(message: &str) {
-    if is_debug_enabled() {
-        eprintln!("[database-debug] {message}");
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -165,10 +152,6 @@ impl<R: Read, W: Write> ScanOperator<R, W> {
         self.start_block = disk.get_file_start_block(&self.file_id)?;
         self.num_blocks = disk.get_file_num_blocks(&self.file_id)?;
         self.initialized = true;
-        debug_log(&format!(
-            "scan init table_file_id={} start_block={} num_blocks={}",
-            self.file_id, self.start_block, self.num_blocks
-        ));
         Ok(())
     }
 
@@ -184,12 +167,6 @@ impl<R: Read, W: Write> ScanOperator<R, W> {
             disk.read_blocks(block_id, 1)?
         };
         self.current_rows = decode_block(&block_data, self.block_size, self.schema.columns())?;
-        debug_log(&format!(
-            "scan file_id={} decoded block_id={} rows_in_block={}",
-            self.file_id,
-            block_id,
-            self.current_rows.len()
-        ));
         self.current_row_idx = 0;
         self.current_block_offset += 1;
         Ok(true)
@@ -340,6 +317,9 @@ pub struct CrossOperator<R: Read, W: Write> {
     anon_allocator: AnonBlockAllocator,
     right_cols: Vec<ColumnCatalog>,
     memory_limit_bytes: u64,
+    /// Join predicates pushed down from a parent Filter.
+    /// Empty = pure cartesian product; non-empty = B-NLJ join.
+    predicates: Vec<Predicate>,
 
     // Populated after spill
     initialized: bool,
@@ -364,13 +344,14 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
         block_size: u64,
         memory_limit_bytes: u64,
         anon_allocator: AnonBlockAllocator,
+        predicates: Vec<Predicate>,
     ) -> Self {
         let schema     = Schema::merge(left.schema(), right.schema());
         let right_cols = right.schema().columns().to_vec();
         CrossOperator {
             left, right: Some(right), schema,
             disk_access, block_size, anon_allocator, right_cols,
-            memory_limit_bytes,
+            memory_limit_bytes, predicates,
             initialized: false, right_is_empty: false,
             right_start_block: 0, right_num_blocks: 0,
             left_chunk: Vec::new(), left_exhausted: false,
@@ -378,6 +359,34 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
             right_block_rows: Vec::new(),
             right_row_idx: 0, left_chunk_idx: 0,
         }
+    }
+
+    /// Check all predicates against the merged row. Empty predicates → always true.
+    fn row_passes(&self, row: &Row) -> Result<bool> {
+        for pred in &self.predicates {
+            let col_idx = self.schema.get_index(&pred.column_name)
+                .ok_or_else(|| anyhow!("CrossOperator: column '{}' not found", pred.column_name))?;
+            let left_val = row.get(col_idx)
+                .ok_or_else(|| anyhow!("CrossOperator: row missing value at index {}", col_idx))?;
+            let right_val: Data = match &pred.value {
+                ComparisionValue::Column(name) => {
+                    let idx = self.schema.get_index(name)
+                        .ok_or_else(|| anyhow!("CrossOperator: column '{}' not found", name))?;
+                    row.get(idx)
+                        .ok_or_else(|| anyhow!("CrossOperator: row missing value at index {}", idx))?
+                        .clone()
+                }
+                ComparisionValue::I32(v)    => Data::Int32(*v),
+                ComparisionValue::I64(v)    => Data::Int64(*v),
+                ComparisionValue::F32(v)    => Data::Float32(*v),
+                ComparisionValue::F64(v)    => Data::Float64(*v),
+                ComparisionValue::String(v) => Data::String(v.clone()),
+            };
+            if !data_compare(left_val, &right_val, &pred.operator)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Estimate in-memory size of one left row (same logic as SortOperator).
@@ -539,7 +548,11 @@ impl<R: Read, W: Write> Operator for CrossOperator<R, W> {
                     let mut values = left_row.values().to_vec();
                     values.extend_from_slice(right_row.values());
                     self.left_chunk_idx += 1;
-                    return Ok(Some(Row::new(values)));
+                    let row = Row::new(values);
+                    if self.row_passes(&row)? {
+                        return Ok(Some(row));
+                    }
+                    continue;
                 }
                 // All left_chunk rows paired with this right row → advance right row
                 self.left_chunk_idx = 0;
@@ -951,6 +964,400 @@ impl<R: Read, W: Write> Operator for SortOperator<R, W> {
 }
 
 // ---------------------------------------------------------------------------
+// SortMergeJoinOperator
+//
+// Assumes both inputs arrive pre-sorted on the equi-join key columns.
+// The optimizer must insert Sort nodes below Join when choosing SMJ.
+//
+// Right equal-group memory policy:
+//   Budget  = memory_limit - PROCESS_OVERHEAD
+//   Max rows in RAM = budget / right_row_size  (conservative overestimate)
+//   If group fits → pure RAM, no disk I/O (fastest path)
+//   If group exceeds limit → spill every row to anonymous disk as it arrives,
+//     then replay via RunReader — 100% safe, no OOM possible
+//
+// Only equi-join predicates (col = col) are accepted. Non-equi predicates
+// are an error (the optimizer must not route them to SMJ).
+// Composite join keys are supported.
+// ---------------------------------------------------------------------------
+
+pub struct SortMergeJoinOperator<R: Read, W: Write> {
+    left:  Box<dyn Operator>,
+    right: Box<dyn Operator>,
+    schema: Schema,
+    left_schema: Schema,
+    right_cols: Vec<ColumnCatalog>,
+
+    /// Aligned equi-join key column indices.
+    left_key_idx:  Vec<usize>,
+    right_key_idx: Vec<usize>,
+
+    // Memory management
+    memory_limit_bytes: u64,
+    disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
+    block_size: u64,
+    anon_allocator: AnonBlockAllocator,
+
+    // State
+    initialized: bool,
+    done: bool,
+    cur_left:    Option<Row>,   // left row currently being paired
+    right_peek:  Option<Row>,   // first right row of the NEXT group (already read)
+
+    // Right equal-group — RAM path
+    right_group_ram: Vec<Row>,
+    right_group_idx: usize,
+
+    // Right equal-group — disk path
+    right_group_on_disk:    bool,
+    right_group_start_block: u64,
+    right_group_num_blocks:  u64,
+    right_group_disk_reader: Option<RunReader<R, W>>,
+}
+
+impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
+    pub fn new(
+        left:  Box<dyn Operator>,
+        right: Box<dyn Operator>,
+        disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
+        block_size: u64,
+        memory_limit_bytes: u64,
+        anon_allocator: AnonBlockAllocator,
+        predicates: Vec<Predicate>,
+    ) -> Result<Self> {
+        let schema      = Schema::merge(left.schema(), right.schema());
+        let left_schema = left.schema().clone();
+        let right_schema = right.schema().clone();
+        let right_cols  = right.schema().columns().to_vec();
+
+        let mut left_key_idx  = Vec::new();
+        let mut right_key_idx = Vec::new();
+
+        for pred in &predicates {
+            if !matches!(pred.operator, ComparisionOperator::EQ) {
+                anyhow::bail!(
+                    "SortMergeJoin: non-equi predicate on column '{}' — SMJ only supports equi-joins",
+                    pred.column_name
+                );
+            }
+            let other_col = match &pred.value {
+                ComparisionValue::Column(c) => c,
+                _ => anyhow::bail!(
+                    "SortMergeJoin: predicate on '{}' compares against a literal — SMJ only supports column=column",
+                    pred.column_name
+                ),
+            };
+
+            // Determine which column is from which side
+            let lk = left_schema.get_index(&pred.column_name);
+            let rk = right_schema.get_index(other_col);
+            if let (Some(li), Some(ri)) = (lk, rk) {
+                left_key_idx.push(li);
+                right_key_idx.push(ri);
+                continue;
+            }
+            // Try reversed orientation: left_schema has other_col, right_schema has column_name
+            let lk = left_schema.get_index(other_col);
+            let rk = right_schema.get_index(&pred.column_name);
+            if let (Some(li), Some(ri)) = (lk, rk) {
+                left_key_idx.push(li);
+                right_key_idx.push(ri);
+                continue;
+            }
+            anyhow::bail!(
+                "SortMergeJoin: predicate '{} = {}' does not reference one column from each side",
+                pred.column_name, other_col
+            );
+        }
+
+        if left_key_idx.is_empty() {
+            anyhow::bail!("SortMergeJoin: no equi-join predicates found");
+        }
+
+        Ok(SortMergeJoinOperator {
+            left, right, schema, left_schema, right_cols,
+            left_key_idx, right_key_idx,
+            memory_limit_bytes, disk_access, block_size, anon_allocator,
+            initialized: false, done: false,
+            cur_left: None, right_peek: None,
+            right_group_ram: Vec::new(), right_group_idx: 0,
+            right_group_on_disk: false,
+            right_group_start_block: 0, right_group_num_blocks: 0,
+            right_group_disk_reader: None,
+        })
+    }
+
+    // ------------------------------------------------------------------
+    // Key helpers
+    // ------------------------------------------------------------------
+
+    fn right_row_size(&self) -> usize {
+        let mut s = 24usize;
+        for col in &self.right_cols {
+            s += match col.data_type { DataType::String => 64, _ => 32 };
+        }
+        s
+    }
+
+    /// Maximum right-group rows we can hold in RAM without exceeding budget.
+    fn max_right_group_rows(&self) -> usize {
+        const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
+        let available = self.memory_limit_bytes.saturating_sub(PROCESS_OVERHEAD) as usize;
+        (available / self.right_row_size()).max(1)
+    }
+
+    fn extract_left_key(&self, row: &Row) -> Vec<Data> {
+        self.left_key_idx.iter()
+            .map(|&i| row.get(i).cloned().unwrap_or(Data::Int32(0)))
+            .collect()
+    }
+
+    fn extract_right_key(&self, row: &Row) -> Vec<Data> {
+        self.right_key_idx.iter()
+            .map(|&i| row.get(i).cloned().unwrap_or(Data::Int32(0)))
+            .collect()
+    }
+
+    fn compare_keys(a: &[Data], b: &[Data]) -> std::cmp::Ordering {
+        for (av, bv) in a.iter().zip(b.iter()) {
+            let ord = av.partial_cmp(bv).unwrap_or(std::cmp::Ordering::Equal);
+            if ord != std::cmp::Ordering::Equal { return ord; }
+        }
+        std::cmp::Ordering::Equal
+    }
+
+    // ------------------------------------------------------------------
+    // Right-group management
+    // ------------------------------------------------------------------
+
+    /// Load all right rows matching `first_row`'s key into the right group.
+    ///
+    /// Memory policy: buffer in RAM while rows_in_group < max_right_group_rows.
+    /// On overflow, spill ALL accumulated rows (and remaining ones) to disk.
+    /// After this call `right_peek` holds the first non-matching right row (or None).
+    fn load_right_group(&mut self, first_row: Row) -> Result<()> {
+        let key      = self.extract_right_key(&first_row);
+        let max_rows = self.max_right_group_rows();
+
+        self.right_group_ram.clear();
+        self.right_group_idx      = 0;
+        self.right_group_on_disk  = false;
+        self.right_group_disk_reader = None;
+
+        self.right_group_ram.push(first_row);
+
+        // Phase 1: fill RAM while under the limit
+        loop {
+            if self.right_group_ram.len() >= max_rows { break; }
+            match self.right.next()? {
+                None => { self.right_peek = None; return Ok(()); }
+                Some(row) => {
+                    let rk = self.extract_right_key(&row);
+                    if Self::compare_keys(&rk, &key) != std::cmp::Ordering::Equal {
+                        self.right_peek = Some(row);
+                        return Ok(());
+                    }
+                    self.right_group_ram.push(row);
+                }
+            }
+        }
+
+        // Phase 2: RAM limit hit — spill everything to disk
+        self.right_group_on_disk = true;
+        let ram_rows = std::mem::take(&mut self.right_group_ram);
+
+        let usable          = self.block_size as usize - 2;
+        let mut block_buf   = vec![0u8; self.block_size as usize];
+        let mut buf_offset  = 0usize;
+        let mut rows_in_blk = 0u16;
+        let mut total_blks  = 0u64;
+        let mut first_blk   = 0u64;
+        let mut got_first   = false;
+
+        // Inline flush helper via a labelled block (avoids borrow conflicts)
+        macro_rules! flush_block {
+            () => {{
+                let footer = block_buf.len() - 2;
+                block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
+                let id = self.anon_allocator.allocate(1);
+                if !got_first { first_blk = id; got_first = true; }
+                self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
+                total_blks += 1;
+                block_buf.fill(0); buf_offset = 0; rows_in_blk = 0;
+            }};
+        }
+
+        for row in ram_rows {
+            let enc = encode_row(&row, &self.right_cols)?;
+            if buf_offset + enc.len() > usable { flush_block!(); }
+            block_buf[buf_offset..buf_offset + enc.len()].copy_from_slice(&enc);
+            buf_offset += enc.len(); rows_in_blk += 1;
+        }
+
+        loop {
+            match self.right.next()? {
+                None => { self.right_peek = None; break; }
+                Some(row) => {
+                    let rk = self.extract_right_key(&row);
+                    if Self::compare_keys(&rk, &key) != std::cmp::Ordering::Equal {
+                        self.right_peek = Some(row); break;
+                    }
+                    let enc = encode_row(&row, &self.right_cols)?;
+                    if buf_offset + enc.len() > usable { flush_block!(); }
+                    block_buf[buf_offset..buf_offset + enc.len()].copy_from_slice(&enc);
+                    buf_offset += enc.len(); rows_in_blk += 1;
+                }
+            }
+        }
+
+        if rows_in_blk > 0 { flush_block!(); }
+
+        self.right_group_start_block = first_blk;
+        self.right_group_num_blocks  = total_blks;
+        self.right_group_disk_reader = Some(RunReader::new(
+            self.disk_access.clone(), self.right_cols.clone(),
+            self.block_size, first_blk, total_blks,
+        ));
+        Ok(())
+    }
+
+    /// Reset the right-group iterator to the beginning (for the next left row
+    /// with the same join key).
+    fn reset_right_group(&mut self) {
+        if self.right_group_on_disk {
+            self.right_group_disk_reader = Some(RunReader::new(
+                self.disk_access.clone(), self.right_cols.clone(),
+                self.block_size,
+                self.right_group_start_block, self.right_group_num_blocks,
+            ));
+        } else {
+            self.right_group_idx = 0;
+        }
+    }
+
+    /// Pull the next row from the right group (RAM or disk).
+    fn next_right_group_row(&mut self) -> Result<Option<Row>> {
+        if self.right_group_on_disk {
+            match self.right_group_disk_reader {
+                Some(ref mut reader) => reader.next_row(),
+                None => Ok(None),
+            }
+        } else {
+            if self.right_group_idx < self.right_group_ram.len() {
+                let row = self.right_group_ram[self.right_group_idx].clone();
+                self.right_group_idx += 1;
+                Ok(Some(row))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Merge-scan positioning
+    // ------------------------------------------------------------------
+
+    /// Advance left and/or right until both point at the same join key,
+    /// then load the right equal-group.
+    ///
+    /// When advancing right past a non-matching key, skip the entire group
+    /// (drain until key changes) so `right_peek` always points to the
+    /// start of an unprocessed group.
+    fn advance_to_next_match(&mut self) -> Result<()> {
+        loop {
+            let lk = match self.cur_left.as_ref() {
+                None    => { self.done = true; return Ok(()); }
+                Some(r) => self.extract_left_key(r),
+            };
+            let rk = match self.right_peek.as_ref() {
+                None    => { self.done = true; return Ok(()); }
+                Some(r) => self.extract_right_key(r),
+            };
+
+            match Self::compare_keys(&lk, &rk) {
+                std::cmp::Ordering::Equal => {
+                    let first = self.right_peek.take().unwrap();
+                    self.load_right_group(first)?;
+                    return Ok(());
+                }
+                std::cmp::Ordering::Less => {
+                    // Left is behind — advance left one row
+                    self.cur_left = self.left.next()?;
+                }
+                std::cmp::Ordering::Greater => {
+                    // Right is behind — drain right_peek's entire key group
+                    let skip_key = self.extract_right_key(self.right_peek.as_ref().unwrap());
+                    loop {
+                        match self.right.next()? {
+                            None => { self.right_peek = None; break; }
+                            Some(row) => {
+                                if Self::compare_keys(&self.extract_right_key(&row), &skip_key)
+                                    != std::cmp::Ordering::Equal
+                                {
+                                    self.right_peek = Some(row);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn initialize(&mut self) -> Result<()> {
+        self.cur_left   = self.left.next()?;
+        self.right_peek = self.right.next()?;
+        if self.cur_left.is_none() || self.right_peek.is_none() {
+            self.done = true;
+        } else {
+            self.advance_to_next_match()?;
+        }
+        self.initialized = true;
+        Ok(())
+    }
+}
+
+impl<R: Read, W: Write> Operator for SortMergeJoinOperator<R, W> {
+    fn schema(&self) -> &Schema { &self.schema }
+
+    fn next(&mut self) -> Result<Option<Row>> {
+        if !self.initialized { self.initialize()?; }
+        if self.done { return Ok(None); }
+
+        loop {
+            match self.next_right_group_row()? {
+                Some(right_row) => {
+                    let left_row = self.cur_left.as_ref().unwrap();
+                    let mut values = left_row.values().to_vec();
+                    values.extend_from_slice(right_row.values());
+                    return Ok(Some(Row::new(values)));
+                }
+                None => {
+                    // Right group exhausted for current left row — advance left
+                    let cur_key = self.extract_left_key(self.cur_left.as_ref().unwrap());
+                    self.cur_left = self.left.next()?;
+                    match self.cur_left.as_ref() {
+                        None => { self.done = true; return Ok(None); }
+                        Some(next) => {
+                            let next_key = self.extract_left_key(next);
+                            if Self::compare_keys(&next_key, &cur_key) == std::cmp::Ordering::Equal {
+                                // Same key — replay the right group
+                                self.reset_right_group();
+                            } else {
+                                // New key — scan forward for next match
+                                self.advance_to_next_match()?;
+                                if self.done { return Ok(None); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // build_operator  —  recursively turn a QueryOp tree into Operator boxes
 // ---------------------------------------------------------------------------
 
@@ -997,7 +1404,18 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
         QueryOp::Cross(d) => {
             let left  = build_operator(&d.left,  catalog, disk_access.clone(), block_size, memory_limit_bytes, anon_allocator)?;
             let right = build_operator(&d.right, catalog, disk_access.clone(), block_size, memory_limit_bytes, anon_allocator)?;
-            Ok(Box::new(CrossOperator::new(left, right, disk_access, block_size, memory_limit_bytes, anon_allocator.clone())))
+            Ok(Box::new(CrossOperator::new(left, right, disk_access, block_size, memory_limit_bytes, anon_allocator.clone(), vec![])))
+        }
+
+        QueryOp::Join(d) => {
+            let left  = build_operator(&d.left,  catalog, disk_access.clone(), block_size, memory_limit_bytes, anon_allocator)?;
+            let right = build_operator(&d.right, catalog, disk_access.clone(), block_size, memory_limit_bytes, anon_allocator)?;
+            match d.algorithm {
+                JoinAlgorithm::BNlj =>
+                    Ok(Box::new(CrossOperator::new(left, right, disk_access, block_size, memory_limit_bytes, anon_allocator.clone(), d.predicates.clone()))),
+                JoinAlgorithm::SortMerge =>
+                    Ok(Box::new(SortMergeJoinOperator::new(left, right, disk_access, block_size, memory_limit_bytes, anon_allocator.clone(), d.predicates.clone())?)),
+            }
         }
     }
 }
