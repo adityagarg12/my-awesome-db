@@ -110,64 +110,171 @@ fn push_filter_through_sort(op: QueryOp, catalog: &Catalog) -> QueryOp {
 }
 
 // ---------------------------------------------------------------------------
-// Rule: selection pushdown
+// Rule: selection pushdown (multi-way join)
 //
-// Filter(Cross(A, B), preds):
-//   Classify each predicate:
-//     left_preds  — all referenced columns are in A's schema
-//     right_preds — all referenced columns are in B's schema
-//     join_preds  — straddle both sides
-//   Push left_preds → Filter(A, left_preds)
-//   Push right_preds → Filter(B, right_preds)
-//   join_preds → Join(A, B, join_preds, BNlj)  [algorithm chosen later]
-//   (select_join_algorithm will pick SMJ if appropriate)
+// Filter(Cross(…nested crosses…), preds):
+//   1. Flatten ALL nested Cross nodes into a flat list of inputs.
+//   2. Classify each predicate:
+//        single-table — every referenced column belongs to exactly one input
+//                       → pushed as Filter directly onto that input
+//        multi-table  — columns span two or more inputs → join predicate
+//   3. Build a left-deep join tree greedily:
+//        At each step pick the next unjoined input that shares a join
+//        predicate with the current joined set (fall back to the next in
+//        list when no equi-join bridge exists, emitting a Cross node).
+//        Emit a Join node when applicable predicates exist; Cross otherwise.
+//   4. Any join predicates not yet consumed are re-wrapped in a Filter.
+//   5. All Join nodes are upgraded to SMJ by select_join_algorithm.
+//
+// Handles N-way joins in a single pass, eliminating the per-pass peeling
+// limitation of the previous two-table approach.
 // ---------------------------------------------------------------------------
-fn push_selections(op: QueryOp, catalog: &Catalog) -> QueryOp {
-    let QueryOp::Filter(filter_data) = op else { return op; };
 
-    let QueryOp::Cross(cross_data) = *filter_data.underlying else {
-        return QueryOp::Filter(filter_data);
-    };
+/// Recursively collect all Cross leaves into a flat Vec.
+/// Non-Cross nodes are left intact as opaque sub-trees.
+fn flatten_cross_inputs(op: QueryOp) -> Vec<QueryOp> {
+    match op {
+        QueryOp::Cross(d) => {
+            let mut v = flatten_cross_inputs(*d.left);
+            v.extend(flatten_cross_inputs(*d.right));
+            v
+        }
+        other => vec![other],
+    }
+}
 
-    let left_cols  = derive_columns_set(&cross_data.left,  catalog);
-    let right_cols = derive_columns_set(&cross_data.right, catalog);
+/// Build a left-deep join/cross tree from a flat list of inputs and a predicate set.
+///
+/// Single-table predicates are pushed directly onto the matching input.
+/// Multi-table predicates become join predicates and are applied as soon as
+/// both sides are present in the growing joined set.
+fn build_join_tree(inputs: Vec<QueryOp>, predicates: Vec<Predicate>, catalog: &Catalog) -> QueryOp {
+    assert!(!inputs.is_empty(), "build_join_tree: empty input list");
 
-    let mut left_preds  = Vec::new();
-    let mut right_preds = Vec::new();
-    let mut join_preds  = Vec::new();
+    // Base case: single input — wrap with any remaining predicates and return.
+    if inputs.len() == 1 {
+        let mut v = inputs;
+        let input = v.remove(0);
+        return if predicates.is_empty() {
+            input
+        } else {
+            QueryOp::Filter(FilterData { underlying: Box::new(input), predicates })
+        };
+    }
 
-    for pred in filter_data.predicates {
+    // Column sets per input for predicate classification and greedy search.
+    // Computed once from the original (unfiltered) ops; Filter wrapping below
+    // does not change the column set.
+    let col_sets: Vec<HashSet<String>> = inputs.iter()
+        .map(|op| derive_columns_set(op, catalog))
+        .collect();
+
+    // Classify predicates: single-table vs multi-table.
+    let mut per_input: Vec<Vec<Predicate>> = vec![Vec::new(); inputs.len()];
+    let mut join_preds: Vec<Predicate>     = Vec::new();
+
+    for pred in predicates {
         let refs: HashSet<String> = predicate_columns(&pred).into_iter().collect();
-        if refs.iter().all(|c| left_cols.contains(c)) {
-            left_preds.push(pred);
-        } else if refs.iter().all(|c| right_cols.contains(c)) {
-            right_preds.push(pred);
+        let touching: Vec<usize>  = (0..col_sets.len())
+            .filter(|&i| refs.iter().any(|c| col_sets[i].contains(c)))
+            .collect();
+        if touching.len() == 1 {
+            per_input[touching[0]].push(pred);
         } else {
             join_preds.push(pred);
         }
     }
 
-    let left = if left_preds.is_empty() {
-        *cross_data.left
-    } else {
-        QueryOp::Filter(FilterData { underlying: cross_data.left, predicates: left_preds })
-    };
-    let right = if right_preds.is_empty() {
-        *cross_data.right
-    } else {
-        QueryOp::Filter(FilterData { underlying: cross_data.right, predicates: right_preds })
-    };
-
-    if join_preds.is_empty() {
-        QueryOp::Cross(CrossData { left: Box::new(left), right: Box::new(right) })
-    } else {
-        QueryOp::Join(JoinData {
-            left:       Box::new(left),
-            right:      Box::new(right),
-            predicates: join_preds,
-            algorithm:  JoinAlgorithm::BNlj, // overridden by select_join_algorithm
+    // Push single-table predicates into their respective inputs.
+    let mut inputs: Vec<QueryOp> = inputs.into_iter().zip(per_input)
+        .map(|(input, preds)| {
+            if preds.is_empty() {
+                input
+            } else {
+                QueryOp::Filter(FilterData { underlying: Box::new(input), predicates: preds })
+            }
         })
+        .collect();
+
+    // col_sets is still valid — Filter wrapping doesn't add/remove columns.
+    let mut col_sets = col_sets;
+
+    // --- Greedy left-deep join tree construction ---
+    let mut current     = inputs.remove(0);
+    let mut joined_cols = col_sets.remove(0);
+    let mut remaining   = join_preds;
+
+    while !inputs.is_empty() {
+        // Pick the next input that bridges to the current joined set via a
+        // join predicate. Fall back to index 0 (true cross product) if none.
+        let next_pos = (0..inputs.len())
+            .find(|&i| {
+                remaining.iter().any(|p| {
+                    let refs: HashSet<String> = predicate_columns(p).into_iter().collect();
+                    refs.iter().any(|c| joined_cols.contains(c))
+                        && refs.iter().any(|c| col_sets[i].contains(c))
+                })
+            })
+            .unwrap_or(0);
+
+        let next      = inputs.remove(next_pos);
+        let next_cols = col_sets.remove(next_pos);
+
+        let new_joined: HashSet<String> = joined_cols.iter().cloned()
+            .chain(next_cols)
+            .collect();
+
+        // Collect every join predicate whose columns are now fully covered.
+        let (applicable, leftover): (Vec<_>, Vec<_>) = remaining
+            .into_iter()
+            .partition(|p| {
+                let refs: HashSet<String> = predicate_columns(p).into_iter().collect();
+                refs.iter().all(|c| new_joined.contains(c))
+            });
+        remaining = leftover;
+
+        current = if applicable.is_empty() {
+            QueryOp::Cross(CrossData {
+                left:  Box::new(current),
+                right: Box::new(next),
+            })
+        } else {
+            QueryOp::Join(JoinData {
+                left:       Box::new(current),
+                right:      Box::new(next),
+                predicates: applicable,
+                algorithm:  JoinAlgorithm::BNlj, // upgraded to SMJ by select_join_algorithm
+            })
+        };
+
+        joined_cols = new_joined;
     }
+
+    // Stray predicates (disconnected join graph — rare but safe to handle).
+    if !remaining.is_empty() {
+        current = QueryOp::Filter(FilterData {
+            underlying: Box::new(current),
+            predicates: remaining,
+        });
+    }
+
+    current
+}
+
+fn push_selections(op: QueryOp, catalog: &Catalog) -> QueryOp {
+    let QueryOp::Filter(filter_data) = op else { return op; };
+
+    // Only act when the immediate child is a Cross node.
+    if !matches!(*filter_data.underlying, QueryOp::Cross(_)) {
+        return QueryOp::Filter(filter_data);
+    }
+    let QueryOp::Cross(cross_data) = *filter_data.underlying else { unreachable!() };
+
+    // Flatten ALL nested Cross nodes, then build the join tree in one pass.
+    let mut inputs = flatten_cross_inputs(*cross_data.left);
+    inputs.extend(flatten_cross_inputs(*cross_data.right));
+
+    build_join_tree(inputs, filter_data.predicates, catalog)
 }
 
 // ---------------------------------------------------------------------------
