@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use common::query::{
-    ComparisionValue, CrossData, FilterData, JoinAlgorithm, JoinData,
+    ComparisionOperator, ComparisionValue, CrossData, FilterData, JoinAlgorithm, JoinData,
     Predicate, ProjectData, QueryOp, SortData, SortSpec,
 };
 use crate::catalog::Catalog;
@@ -117,14 +117,18 @@ fn push_filter_through_sort(op: QueryOp, catalog: &Catalog) -> QueryOp {
 //   2. Classify each predicate:
 //        single-table — every referenced column belongs to exactly one input
 //                       → pushed as Filter directly onto that input
-//        multi-table  — columns span two or more inputs → join predicate
+//        equi-join    — EQ, column=column, spans exactly two inputs
+//                       → goes into the Join node; eligible for SMJ
+//        residual     — non-EQ or literal-valued multi-table predicate
+//                       → applied as a Filter on top of the join output
 //   3. Build a left-deep join tree greedily:
-//        At each step pick the next unjoined input that shares a join
-//        predicate with the current joined set (fall back to the next in
-//        list when no equi-join bridge exists, emitting a Cross node).
-//        Emit a Join node when applicable predicates exist; Cross otherwise.
-//   4. Any join predicates not yet consumed are re-wrapped in a Filter.
-//   5. All Join nodes are upgraded to SMJ by select_join_algorithm.
+//        At each step pick the next unjoined input that shares an equi-join
+//        predicate with the current joined set (fall back to next in list
+//        when no equi-join bridge exists, emitting a Cross node).
+//        Emit a Join node for equi-join predicates; Cross otherwise.
+//        Wrap each step's output with a Filter for any residual predicates
+//        that become applicable at that step.
+//   4. All Join nodes are upgraded to SMJ by select_join_algorithm.
 //
 // Handles N-way joins in a single pass, eliminating the per-pass peeling
 // limitation of the previous two-table approach.
@@ -169,9 +173,13 @@ fn build_join_tree(inputs: Vec<QueryOp>, predicates: Vec<Predicate>, catalog: &C
         .map(|op| derive_columns_set(op, catalog))
         .collect();
 
-    // Classify predicates: single-table vs multi-table.
-    let mut per_input: Vec<Vec<Predicate>> = vec![Vec::new(); inputs.len()];
-    let mut join_preds: Vec<Predicate>     = Vec::new();
+    // Classify predicates into three buckets:
+    //   per_input   — single-table: pushed down as Filter on that input
+    //   equi_preds  — EQ column=column spanning two inputs: used as Join predicate (SMJ-eligible)
+    //   residual    — non-EQ or literal multi-table: applied as Filter on top of the join
+    let mut per_input:  Vec<Vec<Predicate>> = vec![Vec::new(); inputs.len()];
+    let mut equi_preds: Vec<Predicate>      = Vec::new();
+    let mut residual:   Vec<Predicate>      = Vec::new();
 
     for pred in predicates {
         let refs: HashSet<String> = predicate_columns(&pred).into_iter().collect();
@@ -181,7 +189,14 @@ fn build_join_tree(inputs: Vec<QueryOp>, predicates: Vec<Predicate>, catalog: &C
         if touching.len() == 1 {
             per_input[touching[0]].push(pred);
         } else {
-            join_preds.push(pred);
+            // Multi-table: equi-join (EQ + column=column) vs residual
+            let is_equi = matches!(pred.operator, ComparisionOperator::EQ)
+                && matches!(pred.value, ComparisionValue::Column(_));
+            if is_equi {
+                equi_preds.push(pred);
+            } else {
+                residual.push(pred);
+            }
         }
     }
 
@@ -200,16 +215,23 @@ fn build_join_tree(inputs: Vec<QueryOp>, predicates: Vec<Predicate>, catalog: &C
     let mut col_sets = col_sets;
 
     // --- Greedy left-deep join tree construction ---
-    let mut current     = inputs.remove(0);
-    let mut joined_cols = col_sets.remove(0);
-    let mut remaining   = join_preds;
+    let mut current          = inputs.remove(0);
+    let mut joined_cols      = col_sets.remove(0);
+    let mut rem_equi         = equi_preds;
+    let mut rem_residual     = residual;
+
+    // Helper closure: true when all columns referenced by a predicate are
+    // already present in `cols`.
+    let all_covered = |p: &Predicate, cols: &HashSet<String>| -> bool {
+        predicate_columns(p).iter().all(|c| cols.contains(c))
+    };
 
     while !inputs.is_empty() {
-        // Pick the next input that bridges to the current joined set via a
-        // join predicate. Fall back to index 0 (true cross product) if none.
+        // Pick the next input that bridges to the current joined set via an
+        // equi-join predicate. Fall back to index 0 (true cross product) if none.
         let next_pos = (0..inputs.len())
             .find(|&i| {
-                remaining.iter().any(|p| {
+                rem_equi.iter().any(|p| {
                     let refs: HashSet<String> = predicate_columns(p).into_iter().collect();
                     refs.iter().any(|c| joined_cols.contains(c))
                         && refs.iter().any(|c| col_sets[i].contains(c))
@@ -224,16 +246,19 @@ fn build_join_tree(inputs: Vec<QueryOp>, predicates: Vec<Predicate>, catalog: &C
             .chain(next_cols)
             .collect();
 
-        // Collect every join predicate whose columns are now fully covered.
-        let (applicable, leftover): (Vec<_>, Vec<_>) = remaining
+        // Equi-join predicates now fully covered → go into the Join node.
+        let (applicable_eq, leftover_eq): (Vec<_>, Vec<_>) = rem_equi
             .into_iter()
-            .partition(|p| {
-                let refs: HashSet<String> = predicate_columns(p).into_iter().collect();
-                refs.iter().all(|c| new_joined.contains(c))
-            });
-        remaining = leftover;
+            .partition(|p| all_covered(p, &new_joined));
+        rem_equi = leftover_eq;
 
-        current = if applicable.is_empty() {
+        // Residual predicates now fully covered → Filter on top of the join.
+        let (applicable_res, leftover_res): (Vec<_>, Vec<_>) = rem_residual
+            .into_iter()
+            .partition(|p| all_covered(p, &new_joined));
+        rem_residual = leftover_res;
+
+        current = if applicable_eq.is_empty() {
             QueryOp::Cross(CrossData {
                 left:  Box::new(current),
                 right: Box::new(next),
@@ -242,19 +267,28 @@ fn build_join_tree(inputs: Vec<QueryOp>, predicates: Vec<Predicate>, catalog: &C
             QueryOp::Join(JoinData {
                 left:       Box::new(current),
                 right:      Box::new(next),
-                predicates: applicable,
+                predicates: applicable_eq,
                 algorithm:  JoinAlgorithm::BNlj, // upgraded to SMJ by select_join_algorithm
             })
         };
+
+        // Apply residual (non-EQ) predicates as a Filter on top.
+        if !applicable_res.is_empty() {
+            current = QueryOp::Filter(FilterData {
+                underlying: Box::new(current),
+                predicates: applicable_res,
+            });
+        }
 
         joined_cols = new_joined;
     }
 
     // Stray predicates (disconnected join graph — rare but safe to handle).
-    if !remaining.is_empty() {
+    let stray: Vec<Predicate> = rem_equi.into_iter().chain(rem_residual).collect();
+    if !stray.is_empty() {
         current = QueryOp::Filter(FilterData {
             underlying: Box::new(current),
-            predicates: remaining,
+            predicates: stray,
         });
     }
 
@@ -338,6 +372,8 @@ fn extract_join_key_cols(
     let mut right_key = Vec::new();
 
     for pred in predicates {
+        // Only EQ column=column predicates are valid SMJ sort keys.
+        if !matches!(pred.operator, ComparisionOperator::EQ) { continue; }
         if let ComparisionValue::Column(other) = &pred.value {
             if left_set.contains(&pred.column_name) && right_set.contains(other) {
                 left_key.push(pred.column_name.clone());
