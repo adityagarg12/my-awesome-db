@@ -405,20 +405,22 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
     /// freed before B-NLJ begins, and the B-NLJ phase only holds the left
     /// chunk + one decoded right block simultaneously.
     ///
-    /// Process overhead (release binary ~12 MB, debug ~14 MB):
-    ///   text + data      : ~1.2 MB release / 2.7 MB debug
-    ///   shared libs      : ~2.5 MB (libc, libgcc)
+    /// Process overhead (dynamic executable, WSL2):
+    ///   text + data      : ~2–5 MB release / ~8 MB debug
+    ///   shared libs      : ~10–15 MB (glibc, libgcc, libm, …)
     ///   stack reservation: ~8 MB  (Linux default)
-    ///   heap metadata    : ~0.5 MB
+    ///   heap metadata    : ~1–2 MB
     ///   right block buf  : 4 × block_size (~16 KB, negligible)
     ///
-    /// Reserve 16 MB for all overhead; give everything else to the left chunk.
-    /// 64 MB limit  → 48 MB available (75 %)
-    /// 256 MB limit → 240 MB available (94 %)
+    /// Reserve 48 MB for all overhead; give everything else to the left chunk.
+    /// 64 MB limit  → 16 MB available (25 %)
+    /// 256 MB limit → 208 MB available (81 %)
     /// 
     fn left_chunk_capacity(&self) -> usize {
-        // TO BE CHECK , we can adjust the PROCESS_OVERHEAD estimate if needed based on actual measurements, which came around 14mb at startup in debug mode and 12mb in release mode. We want to be conservative to avoid OOM, but not too much to underutilize memory.
-        const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024; // 32 MB
+        // The memory limit covers the full process image (executable, shared libs,
+        // stack, heap metadata).  Observed footprint on WSL2: 30–38 MB.
+        // 48 MB gives headroom above the measured peak for all build modes.
+        const PROCESS_OVERHEAD: u64 = 48 * 1024 * 1024;
         let right_buf = self.block_size * 4;
         let available = self.memory_limit_bytes
             .saturating_sub(PROCESS_OVERHEAD)
@@ -756,13 +758,15 @@ impl<R: Read, W: Write> SortOperator<R, W> {
     ///   fan_in   =  (available − block_size) / per_run
     /// 
     fn merge_fan_in(&self) -> usize {
-        // to be check
-        const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
+        // The memory limit covers the entire process: executable segments,
+        // shared libraries (mmaped), main stack, and heap metadata together
+        // consume roughly 30–38 MB in practice (debug binary, WSL2).
+        // We budget 48 MB to stay clear of that ceiling under all build modes.
+        const PROCESS_OVERHEAD: u64 = 48 * 1024 * 1024;
         let available = self.memory_limit_bytes
             .saturating_sub(PROCESS_OVERHEAD)
-            .saturating_sub(self.block_size) as usize;
-        //TO BE CHECK
-        let key_size  = 24 + self.sort_specs.len() * 40; // Vec header (24) + (Data,bool) per col (40)
+            .saturating_sub(self.block_size) as usize; // subtract 1 output block
+        let key_size  = 24 + self.sort_specs.len() * 40; // Vec header (24) + (Data,bool) per col
         let per_run   = self.block_size as usize + key_size;
         (available / per_run.max(1)).max(2)
     }
@@ -854,10 +858,15 @@ impl<R: Read, W: Write> SortOperator<R, W> {
 
     fn initialize(&mut self) -> Result<()> {
         let row_size = self.row_mem_estimate();
-        // Use 40% of the memory budget for one sorting chunk.
-        // The 40% accounts for encode_rows_to_blocks allocating a second Vec<u8>
-        // of similar size simultaneously during write_run (2 × 40% = 80% peak).
-        let budget = self.memory_limit_bytes as usize * 40 / 100;
+        // Subtract the fixed process footprint first (same constant as merge_fan_in).
+        // write_run calls encode_rows_to_blocks which allocates a second Vec<u8>
+        // of comparable size while the chunk Vec<Row> is still live, so peak heap
+        // usage during a spill is ~2× the chunk bytes.  Using 40% of the
+        // remaining budget means the peak (2 × 40% = 80%) stays inside the
+        // available window with 20% headroom for allocator bookkeeping.
+        const PROCESS_OVERHEAD: u64 = 48 * 1024 * 1024;
+        let available = self.memory_limit_bytes.saturating_sub(PROCESS_OVERHEAD);
+        let budget = available as usize * 40 / 100;
         if budget < row_size {
             anyhow::bail!(
                 "SortOperator: memory limit ({} bytes) too small to hold even one row (~{} bytes estimated)",
@@ -1101,7 +1110,7 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
 
     /// Maximum right-group rows we can hold in RAM without exceeding budget.
     fn max_right_group_rows(&self) -> usize {
-        const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
+        const PROCESS_OVERHEAD: u64 = 48 * 1024 * 1024;
         let available = self.memory_limit_bytes.saturating_sub(PROCESS_OVERHEAD) as usize;
         (available / self.right_row_size()).max(1)
     }
