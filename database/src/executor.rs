@@ -725,14 +725,59 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         });
     }
 
+    /// Write a sorted chunk to anonymous disk one block at a time.
+    ///
+    /// Unlike the old implementation (which called encode_rows_to_blocks and
+    /// kept a full encoded Vec<u8> equal in size to the in-memory chunk in RAM
+    /// simultaneously), this encodes and flushes one block at a time so the
+    /// only extra allocation is a single block_size buffer (~4 KB).
+    ///
+    /// Peak additional memory: block_size (negligible).
     fn write_run(&self, rows: &[Row]) -> Result<(u64, u64)> {
-        let encoded = encode_rows_to_blocks(rows, self.block_size, self.schema.columns())?;
-        let num_blocks = (encoded.len() as u64 + self.block_size - 1) / self.block_size;
-        // encode_rows_to_blocks always returns a multiple of block_size
-        let start = self.anon_allocator.allocate(num_blocks);
-        let mut disk = self.disk_access.lock().unwrap();
-        disk.write_blocks(start, num_blocks, &encoded)?;
-        Ok((start, num_blocks))
+        let cols   = self.schema.columns();
+        let usable = self.block_size as usize - 2;
+
+        let mut block_buf   = vec![0u8; self.block_size as usize];
+        let mut buf_offset  = 0usize;
+        let mut rows_in_blk = 0u16;
+        let mut total_blks  = 0u64;
+        let mut first_blk   = 0u64;
+        let mut got_first   = false;
+
+        for row in rows {
+            let enc = encode_row(row, cols)?;
+            if enc.len() > usable {
+                anyhow::bail!(
+                    "SortOperator: row ({} B) exceeds usable block space ({} B)",
+                    enc.len(), usable
+                );
+            }
+            if buf_offset + enc.len() > usable {
+                // Flush full block
+                let footer = block_buf.len() - 2;
+                block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
+                let id = self.anon_allocator.allocate(1);
+                if !got_first { first_blk = id; got_first = true; }
+                self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
+                total_blks += 1;
+                block_buf.fill(0); buf_offset = 0; rows_in_blk = 0;
+            }
+            block_buf[buf_offset..buf_offset + enc.len()].copy_from_slice(&enc);
+            buf_offset  += enc.len();
+            rows_in_blk += 1;
+        }
+
+        // Flush the final (possibly partial) block.
+        if rows_in_blk > 0 {
+            let footer = block_buf.len() - 2;
+            block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
+            let id = self.anon_allocator.allocate(1);
+            if !got_first { first_blk = id; }
+            self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
+            total_blks += 1;
+        }
+
+        Ok((first_blk, total_blks))
     }
 
     fn make_heap_key(&self, row: &Row) -> Vec<(Data, bool)> {
@@ -854,10 +899,26 @@ impl<R: Read, W: Write> SortOperator<R, W> {
 
     fn initialize(&mut self) -> Result<()> {
         let row_size = self.row_mem_estimate();
-        // Use 40% of the memory budget for one sorting chunk.
-        // The 40% accounts for encode_rows_to_blocks allocating a second Vec<u8>
-        // of similar size simultaneously during write_run (2 × 40% = 80% peak).
-        let budget = self.memory_limit_bytes as usize * 40 / 100;
+        // Sorting chunk budget.
+        //
+        // write_run now encodes and flushes one block at a time (peak extra
+        // memory = one block_size buffer ≈ 4 KB), so we no longer need to
+        // reserve half the budget for a monolithic encoded Vec.
+        //
+        // Budget = 70 % of memory available after subtracting process overhead.
+        // The remaining 30 % covers:
+        //   - one block_size write buffer during write_run (≈ 4 KB)
+        //   - RunReader blocks during the merge phase (fan_in × block_size)
+        //   - SMJ right-group rows held by parent operators
+        //   - Other heap allocations in the pipeline
+        //
+        // Process overhead accounts for: binary .text/.data, mmap'd shared
+        // libraries, stack reservation, heap metadata, and Rust runtime.
+        // Measured at ~12 MB (release) / ~14 MB (debug) at startup; 32 MB
+        // is kept as a safety margin for the portal's larger shared-lib set.
+        const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
+        let usable = self.memory_limit_bytes.saturating_sub(PROCESS_OVERHEAD);
+        let budget = (usable as usize) * 70 / 100;
         if budget < row_size {
             anyhow::bail!(
                 "SortOperator: memory limit ({} bytes) too small to hold even one row (~{} bytes estimated)",
