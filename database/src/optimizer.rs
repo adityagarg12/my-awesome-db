@@ -399,27 +399,24 @@ fn select_join_algorithm(op: QueryOp, catalog: &Catalog) -> QueryOp {
     let (left_key, right_key) = extract_join_key_cols(&d.predicates, &d.left, &d.right, catalog);
 
     if left_key.is_empty() {
-        // No equi-join keys found — can't use SMJ, keep B-NLJ
+        // No equi-join keys — can't use hash join or SMJ; keep B-NLJ
         return QueryOp::Join(d);
     }
 
     let left_specs  = make_sort_specs(&left_key);
     let right_specs = make_sort_specs(&right_key);
 
-    if !is_sorted_on(&d.left, &left_specs) {
-        d.left = Box::new(QueryOp::Sort(SortData {
-            underlying: d.left,
-            sort_specs: left_specs,
-        }));
-    }
-    if !is_sorted_on(&d.right, &right_specs) {
-        d.right = Box::new(QueryOp::Sort(SortData {
-            underlying: d.right,
-            sort_specs: right_specs,
-        }));
+    let left_sorted  = is_sorted_on(&d.left,  &left_specs);
+    let right_sorted = is_sorted_on(&d.right, &right_specs);
+
+    if left_sorted && right_sorted {
+        // Both sides already sorted — SMJ is free (no extra Sort nodes needed)
+        d.algorithm = JoinAlgorithm::SortMerge;
+    } else {
+        // Unsorted inputs — HashJoin avoids O(N log N) sort cost on both sides
+        d.algorithm = JoinAlgorithm::HashJoin;
     }
 
-    d.algorithm = JoinAlgorithm::SortMerge;
     QueryOp::Join(d)
 }
 

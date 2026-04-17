@@ -1419,6 +1419,394 @@ impl<R: Read, W: Write> Operator for SortMergeJoinOperator<R, W> {
 }
 
 // ---------------------------------------------------------------------------
+// HashJoinOperator
+//
+// Phase 1 (initialize): consume the right child into a HashMap keyed by
+//   encoded join-key bytes. If right-side rows exceed the memory budget,
+//   fall back to Grace Hash Join: partition both sides into GRACE_N disk
+//   buckets by fnv1a(key) % GRACE_N, then process each bucket pair
+//   sequentially (one right bucket loaded into a fresh HashMap per round).
+//
+// Phase 2 (next): stream left rows (from self.left or a partition RunReader)
+//   and look up the hash table, emitting one joined row per call.
+//
+// Memory budget: (memory_limit − 32 MB overhead) × 60 %.
+// Grace partition count: 32 — handles right sides up to 32× budget.
+// ---------------------------------------------------------------------------
+
+pub struct HashJoinOperator<R: Read, W: Write> {
+    left:  Box<dyn Operator>,
+    right: Option<Box<dyn Operator>>,
+    schema: Schema,
+    left_cols:     Vec<ColumnCatalog>,
+    right_cols:    Vec<ColumnCatalog>,
+    left_key_idx:  Vec<usize>,
+    right_key_idx: Vec<usize>,
+    memory_limit_bytes: u64,
+    disk_access:    Arc<Mutex<DiskAccessLayer<R, W>>>,
+    block_size:     u64,
+    anon_allocator: AnonBlockAllocator,
+
+    initialized: bool,
+    done:        bool,
+    use_grace:   bool,
+
+    // Hash table: entire right side (in-memory path) or one partition (grace path).
+    hash_table: HashMap<Vec<u8>, Vec<Row>>,
+
+    // Probe state (shared between both paths)
+    current_left_row: Option<Row>,
+    current_matches:  Vec<Row>,
+    match_idx:        usize,
+
+    // Grace Hash Join bookkeeping
+    num_partitions:    usize,
+    current_partition: usize,
+    left_partitions:   Vec<(u64, u64)>,   // (start_block, num_blocks) per partition
+    right_partitions:  Vec<(u64, u64)>,
+    left_reader:       Option<RunReader<R, W>>,
+}
+
+impl<R: Read, W: Write> HashJoinOperator<R, W> {
+    pub fn new(
+        left:  Box<dyn Operator>,
+        right: Box<dyn Operator>,
+        disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
+        block_size: u64,
+        memory_limit_bytes: u64,
+        anon_allocator: AnonBlockAllocator,
+        predicates: Vec<Predicate>,
+    ) -> Result<Self> {
+        let schema      = Schema::merge(left.schema(), right.schema());
+        let left_schema  = left.schema();
+        let right_schema = right.schema();
+        let left_cols    = left_schema.columns().to_vec();
+        let right_cols   = right_schema.columns().to_vec();
+
+        let mut left_key_idx  = Vec::new();
+        let mut right_key_idx = Vec::new();
+
+        for pred in &predicates {
+            if !matches!(pred.operator, ComparisionOperator::EQ) {
+                anyhow::bail!(
+                    "HashJoin: only equi-join (=) predicates supported, got column '{}'",
+                    pred.column_name
+                );
+            }
+            let other = match &pred.value {
+                ComparisionValue::Column(c) => c.as_str(),
+                _ => anyhow::bail!("HashJoin: literal predicates not supported"),
+            };
+            if let (Some(li), Some(ri)) = (
+                left_schema.get_index(&pred.column_name),
+                right_schema.get_index(other),
+            ) {
+                left_key_idx.push(li); right_key_idx.push(ri); continue;
+            }
+            if let (Some(li), Some(ri)) = (
+                left_schema.get_index(other),
+                right_schema.get_index(&pred.column_name),
+            ) {
+                left_key_idx.push(li); right_key_idx.push(ri); continue;
+            }
+            anyhow::bail!(
+                "HashJoin: predicate '{} = {}' does not span left and right schemas",
+                pred.column_name, other
+            );
+        }
+        if left_key_idx.is_empty() {
+            anyhow::bail!("HashJoin: no equi-join predicates");
+        }
+
+        Ok(HashJoinOperator {
+            left, right: Some(right), schema, left_cols, right_cols,
+            left_key_idx, right_key_idx,
+            memory_limit_bytes, disk_access, block_size, anon_allocator,
+            initialized: false, done: false, use_grace: false,
+            hash_table: HashMap::new(),
+            current_left_row: None, current_matches: Vec::new(), match_idx: 0,
+            num_partitions: 0, current_partition: 0,
+            left_partitions: Vec::new(), right_partitions: Vec::new(),
+            left_reader: None,
+        })
+    }
+
+    // ------------------------------------------------------------------
+    // Memory helpers
+    // ------------------------------------------------------------------
+
+    fn right_row_mem(&self) -> usize {
+        let mut s = 48usize; // Row + Vec + HashMap entry overhead
+        for col in &self.right_cols {
+            s += match col.data_type { DataType::String => 64, _ => 32 };
+        }
+        s
+    }
+
+    fn hash_budget_rows(&self) -> usize {
+        const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
+        let avail  = self.memory_limit_bytes.saturating_sub(PROCESS_OVERHEAD);
+        let budget = (avail as usize) * 60 / 100;
+        (budget / self.right_row_mem()).max(64)
+    }
+
+    // ------------------------------------------------------------------
+    // Key encoding (deterministic byte serialization, safe for HashMap)
+    // ------------------------------------------------------------------
+
+    fn encode_key(row: &Row, indices: &[usize]) -> Vec<u8> {
+        let mut key = Vec::new();
+        for &idx in indices {
+            match row.get(idx) {
+                Some(Data::Int32(v))   => key.extend_from_slice(&v.to_le_bytes()),
+                Some(Data::Int64(v))   => key.extend_from_slice(&v.to_le_bytes()),
+                Some(Data::Float32(v)) => key.extend_from_slice(&v.to_bits().to_le_bytes()),
+                Some(Data::Float64(v)) => key.extend_from_slice(&v.to_bits().to_le_bytes()),
+                Some(Data::String(s))  => { key.extend_from_slice(s.as_bytes()); key.push(0); }
+                None                   => key.push(0xFF),
+            }
+        }
+        key
+    }
+
+    fn fnv1a(key: &[u8], n: usize) -> usize {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in key { h = h.wrapping_mul(0x100000001b3) ^ (b as u64); }
+        (h as usize) % n
+    }
+
+    // ------------------------------------------------------------------
+    // Grace path helpers
+    // ------------------------------------------------------------------
+
+    fn load_right_partition(&mut self, idx: usize) -> Result<()> {
+        self.hash_table.clear();
+        let (start, n) = self.right_partitions[idx];
+        if n == 0 { return Ok(()); }
+        let mut reader = RunReader::new(
+            self.disk_access.clone(), self.right_cols.clone(),
+            self.block_size, start, n,
+        );
+        while let Some(row) = reader.next_row()? {
+            let key = Self::encode_key(&row, &self.right_key_idx);
+            self.hash_table.entry(key).or_default().push(row);
+        }
+        Ok(())
+    }
+
+    fn open_left_partition(&mut self, idx: usize) {
+        let (start, n) = self.left_partitions[idx];
+        self.left_reader = if n > 0 {
+            Some(RunReader::new(
+                self.disk_access.clone(), self.left_cols.clone(),
+                self.block_size, start, n,
+            ))
+        } else {
+            None
+        };
+    }
+
+    // ------------------------------------------------------------------
+    // Initialization: build hash table or set up grace hash join
+    // ------------------------------------------------------------------
+
+    fn initialize(&mut self) -> Result<()> {
+        let budget = self.hash_budget_rows();
+        let mut right_child = self.right.take().unwrap();
+        let mut ram_rows: Vec<Row> = Vec::new();
+
+        // Read right side into RAM until budget exhausted
+        let mut overflow = false;
+        loop {
+            match right_child.next()? {
+                None => break,
+                Some(row) => {
+                    ram_rows.push(row);
+                    if ram_rows.len() > budget { overflow = true; break; }
+                }
+            }
+        }
+
+        if !overflow {
+            // All right rows fit — build in-memory hash table
+            for row in ram_rows {
+                let key = Self::encode_key(&row, &self.right_key_idx);
+                self.hash_table.entry(key).or_default().push(row);
+            }
+            // use_grace remains false; self.left streamed lazily in next()
+        } else {
+            // Grace Hash Join: partition both sides into GRACE_N disk buckets.
+            const GRACE_N: usize = 32;
+            self.num_partitions = GRACE_N;
+            let usable = self.block_size as usize - 2;
+
+            // ── Partition RIGHT side ──────────────────────────────────
+            {
+                struct PBuf { blk: Vec<u8>, off: usize, cnt: u16, first: u64, total: u64 }
+                let mut parts: Vec<PBuf> = (0..GRACE_N).map(|_| PBuf {
+                    blk: vec![0u8; self.block_size as usize],
+                    off: 0, cnt: 0, first: 0, total: 0,
+                }).collect();
+
+                let right_key  = self.right_key_idx.clone();
+                let right_cols = self.right_cols.clone();
+
+                macro_rules! write_right {
+                    ($row:expr) => {{
+                        let key = Self::encode_key(&$row, &right_key);
+                        let p   = Self::fnv1a(&key, GRACE_N);
+                        let enc = encode_row(&$row, &right_cols)?;
+                        anyhow::ensure!(enc.len() <= usable, "HashJoin: right row too large for block");
+                        let pb  = &mut parts[p];
+                        if pb.off + enc.len() > usable {
+                            let footer = pb.blk.len() - 2;
+                            pb.blk[footer..].copy_from_slice(&pb.cnt.to_le_bytes());
+                            let id = self.anon_allocator.allocate(1);
+                            if pb.total == 0 { pb.first = id; }
+                            self.disk_access.lock().unwrap().write_blocks(id, 1, &pb.blk)?;
+                            pb.total += 1; pb.blk.fill(0); pb.off = 0; pb.cnt = 0;
+                        }
+                        pb.blk[pb.off..pb.off + enc.len()].copy_from_slice(&enc);
+                        pb.off += enc.len(); pb.cnt += 1;
+                    }};
+                }
+
+                for row in ram_rows.drain(..) { write_right!(row); }
+                drop(ram_rows);
+                while let Some(row) = right_child.next()? { write_right!(row); }
+                drop(right_child);
+
+                let mut rp = Vec::with_capacity(GRACE_N);
+                for pb in &mut parts {
+                    if pb.cnt > 0 {
+                        let footer = pb.blk.len() - 2;
+                        pb.blk[footer..].copy_from_slice(&pb.cnt.to_le_bytes());
+                        let id = self.anon_allocator.allocate(1);
+                        if pb.total == 0 { pb.first = id; }
+                        self.disk_access.lock().unwrap().write_blocks(id, 1, &pb.blk)?;
+                        pb.total += 1;
+                    }
+                    rp.push((pb.first, pb.total));
+                }
+                self.right_partitions = rp;
+            }
+
+            // ── Partition LEFT side ───────────────────────────────────
+            {
+                struct PBuf { blk: Vec<u8>, off: usize, cnt: u16, first: u64, total: u64 }
+                let mut parts: Vec<PBuf> = (0..GRACE_N).map(|_| PBuf {
+                    blk: vec![0u8; self.block_size as usize],
+                    off: 0, cnt: 0, first: 0, total: 0,
+                }).collect();
+
+                let left_key  = self.left_key_idx.clone();
+                let left_cols = self.left_cols.clone();
+
+                while let Some(row) = self.left.next()? {
+                    let key = Self::encode_key(&row, &left_key);
+                    let p   = Self::fnv1a(&key, GRACE_N);
+                    let enc = encode_row(&row, &left_cols)?;
+                    anyhow::ensure!(enc.len() <= usable, "HashJoin: left row too large for block");
+                    let pb  = &mut parts[p];
+                    if pb.off + enc.len() > usable {
+                        let footer = pb.blk.len() - 2;
+                        pb.blk[footer..].copy_from_slice(&pb.cnt.to_le_bytes());
+                        let id = self.anon_allocator.allocate(1);
+                        if pb.total == 0 { pb.first = id; }
+                        self.disk_access.lock().unwrap().write_blocks(id, 1, &pb.blk)?;
+                        pb.total += 1; pb.blk.fill(0); pb.off = 0; pb.cnt = 0;
+                    }
+                    pb.blk[pb.off..pb.off + enc.len()].copy_from_slice(&enc);
+                    pb.off += enc.len(); pb.cnt += 1;
+                }
+
+                let mut lp = Vec::with_capacity(GRACE_N);
+                for pb in &mut parts {
+                    if pb.cnt > 0 {
+                        let footer = pb.blk.len() - 2;
+                        pb.blk[footer..].copy_from_slice(&pb.cnt.to_le_bytes());
+                        let id = self.anon_allocator.allocate(1);
+                        if pb.total == 0 { pb.first = id; }
+                        self.disk_access.lock().unwrap().write_blocks(id, 1, &pb.blk)?;
+                        pb.total += 1;
+                    }
+                    lp.push((pb.first, pb.total));
+                }
+                self.left_partitions = lp;
+            }
+
+            self.use_grace = true;
+            self.current_partition = 0;
+            self.load_right_partition(0)?;
+            self.open_left_partition(0);
+        }
+
+        self.initialized = true;
+        Ok(())
+    }
+
+    fn probe(&mut self, left_row: Row) {
+        let key = Self::encode_key(&left_row, &self.left_key_idx);
+        self.current_matches = self.hash_table.get(&key).cloned().unwrap_or_default();
+        self.match_idx = 0;
+        self.current_left_row = Some(left_row);
+    }
+}
+
+impl<R: Read, W: Write> Operator for HashJoinOperator<R, W> {
+    fn schema(&self) -> &Schema { &self.schema }
+
+    fn next(&mut self) -> Result<Option<Row>> {
+        if !self.initialized { self.initialize()?; }
+        if self.done { return Ok(None); }
+
+        loop {
+            // Emit buffered matches for current left row
+            if self.match_idx < self.current_matches.len() {
+                let right_row = self.current_matches[self.match_idx].clone();
+                self.match_idx += 1;
+                let left_row = self.current_left_row.as_ref().unwrap();
+                let mut values = left_row.values().to_vec();
+                values.extend_from_slice(right_row.values());
+                return Ok(Some(Row::new(values)));
+            }
+
+            // Fetch next left row (from child or partition reader)
+            let next_left = if self.use_grace {
+                match self.left_reader.as_mut() {
+                    Some(r) => r.next_row()?,
+                    None    => None,
+                }
+            } else {
+                self.left.next()?
+            };
+
+            match next_left {
+                Some(lrow) => { self.probe(lrow); }
+                None => {
+                    if !self.use_grace {
+                        self.done = true;
+                        return Ok(None);
+                    }
+                    // Advance to next non-empty partition
+                    loop {
+                        self.current_partition += 1;
+                        if self.current_partition >= self.num_partitions {
+                            self.done = true;
+                            return Ok(None);
+                        }
+                        self.load_right_partition(self.current_partition)?;
+                        self.open_left_partition(self.current_partition);
+                        if self.left_reader.is_some() { break; }
+                        // left partition empty — skip
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // build_operator  —  recursively turn a QueryOp tree into Operator boxes
 // ---------------------------------------------------------------------------
 
@@ -1476,6 +1864,8 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
                     Ok(Box::new(CrossOperator::new(left, right, disk_access, block_size, memory_limit_bytes, anon_allocator.clone(), d.predicates.clone()))),
                 JoinAlgorithm::SortMerge =>
                     Ok(Box::new(SortMergeJoinOperator::new(left, right, disk_access, block_size, memory_limit_bytes, anon_allocator.clone(), d.predicates.clone())?)),
+                JoinAlgorithm::HashJoin =>
+                    Ok(Box::new(HashJoinOperator::new(left, right, disk_access, block_size, memory_limit_bytes, anon_allocator.clone(), d.predicates.clone())?)),
             }
         }
     }

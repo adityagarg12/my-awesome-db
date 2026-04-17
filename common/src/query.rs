@@ -58,6 +58,11 @@ pub enum JoinAlgorithm {
     BNlj,
     /// Sort-Merge Join — both inputs must arrive pre-sorted on the join key.
     SortMerge,
+    /// Hash Join — build hash table from right side; Grace Hash Join on overflow.
+    HashJoin,
+    /// Range Merge Join — sort both sides, advance a monotone pointer + active-set eviction.
+    /// Used for band/range joins: A.val > B.lo AND A.val < B.hi (no equality predicate).
+    RangeMerge,
 }
 
 /// Optimizer-internal node: never appears in the input query tree.
