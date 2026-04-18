@@ -631,6 +631,51 @@ impl<R: Read, W: Write> RunReader<R, W> {
     }
 }
 
+/// Reads from a Grace Hash Join partition whose blocks may not be contiguous.
+/// Uses an explicit list of block IDs rather than a start+count range.
+struct PartitionReader<R: Read, W: Write> {
+    disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
+    columns: Vec<ColumnCatalog>,
+    block_size: u64,
+    block_ids: Vec<u64>,
+    block_idx: usize,
+    current_rows: Vec<Row>,
+    row_idx: usize,
+}
+
+impl<R: Read, W: Write> PartitionReader<R, W> {
+    fn new(
+        disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
+        columns: Vec<ColumnCatalog>,
+        block_size: u64,
+        block_ids: Vec<u64>,
+    ) -> Self {
+        PartitionReader { disk_access, columns, block_size, block_ids,
+                          block_idx: 0, current_rows: Vec::new(), row_idx: 0 }
+    }
+
+    fn next_row(&mut self) -> Result<Option<Row>> {
+        loop {
+            if self.row_idx < self.current_rows.len() {
+                let row = self.current_rows[self.row_idx].clone();
+                self.row_idx += 1;
+                return Ok(Some(row));
+            }
+            if self.block_idx >= self.block_ids.len() {
+                return Ok(None);
+            }
+            let block_id = self.block_ids[self.block_idx];
+            let data = {
+                let mut disk = self.disk_access.lock().unwrap();
+                disk.read_blocks(block_id, 1)?
+            };
+            self.current_rows = decode_block(&data, self.block_size, &self.columns)?;
+            self.row_idx = 0;
+            self.block_idx += 1;
+        }
+    }
+}
+
 /// Entry in the k-way merge heap. BinaryHeap is max-heap; we reverse the
 /// comparison so the *smallest* sorted row is popped first.
 struct HeapEntry {
@@ -1419,6 +1464,243 @@ impl<R: Read, W: Write> Operator for SortMergeJoinOperator<R, W> {
 }
 
 // ---------------------------------------------------------------------------
+// RangeMergeJoinOperator
+//
+// Handles band/range joins: probe > lower AND probe < upper (or >= / <=).
+// Both inputs must arrive pre-sorted (the optimizer injects Sort nodes):
+//   Left  (probe side) — sorted by probe_col ascending.
+//   Right (interval side) — sorted by lower_col ascending.
+//
+// Algorithm: monotone pointer + active-set eviction.
+//   b_ptr  : advances through right rows as probe increases (never resets).
+//   active : Vec of live right rows where lower < probe AND upper > probe.
+//            Rows are added from b_ptr when their lower satisfies the bound.
+//            Rows are evicted (retain) when their upper no longer satisfies.
+//
+// Complexity: O((N + M) log M + output)   [log M from eviction amortised]
+//
+// Memory: only "active" rows live in RAM — rows whose interval overlaps the
+//   current probe value.  If the active set grows beyond the memory budget
+//   (extreme interval overlap), a bail error is raised rather than OOM-ing.
+//   Budget = (memory_limit - 32 MB overhead) × 40 %.
+// ---------------------------------------------------------------------------
+
+struct RangeSpec {
+    probe_idx: usize,
+    lower_idx: usize,
+    upper_idx: usize,
+    lower_inclusive: bool,
+    upper_inclusive: bool,
+}
+
+fn parse_range_spec(
+    predicates:   &[Predicate],
+    left_schema:  &Schema,
+    right_schema: &Schema,
+) -> Result<RangeSpec> {
+    let mut probe_col:       Option<String> = None;
+    let mut lower_col:       Option<String> = None;
+    let mut upper_col:       Option<String> = None;
+    let mut lower_inclusive                 = false;
+    let mut upper_inclusive                 = false;
+
+    for pred in predicates {
+        let other = match &pred.value {
+            ComparisionValue::Column(c) => c.as_str(),
+            _ => continue,
+        };
+        // Orientation A: left has pred.column_name, right has other
+        if left_schema.get_index(&pred.column_name).is_some()
+            && right_schema.get_index(other).is_some()
+        {
+            match pred.operator {
+                ComparisionOperator::GT  => { probe_col = Some(pred.column_name.clone()); lower_col = Some(other.to_owned()); lower_inclusive = false; }
+                ComparisionOperator::GTE => { probe_col = Some(pred.column_name.clone()); lower_col = Some(other.to_owned()); lower_inclusive = true;  }
+                ComparisionOperator::LT  => { probe_col = Some(pred.column_name.clone()); upper_col = Some(other.to_owned()); upper_inclusive = false; }
+                ComparisionOperator::LTE => { probe_col = Some(pred.column_name.clone()); upper_col = Some(other.to_owned()); upper_inclusive = true;  }
+                _ => {}
+            }
+        }
+        // Orientation B: right has pred.column_name, left has other (flip operator)
+        else if right_schema.get_index(&pred.column_name).is_some()
+            && left_schema.get_index(other).is_some()
+        {
+            match pred.operator {
+                // right.col < left.other → left.other > right.col → lower bound
+                ComparisionOperator::LT  => { probe_col = Some(other.to_owned()); lower_col = Some(pred.column_name.clone()); lower_inclusive = false; }
+                ComparisionOperator::LTE => { probe_col = Some(other.to_owned()); lower_col = Some(pred.column_name.clone()); lower_inclusive = true;  }
+                // right.col > left.other → left.other < right.col → upper bound
+                ComparisionOperator::GT  => { probe_col = Some(other.to_owned()); upper_col = Some(pred.column_name.clone()); upper_inclusive = false; }
+                ComparisionOperator::GTE => { probe_col = Some(other.to_owned()); upper_col = Some(pred.column_name.clone()); upper_inclusive = true;  }
+                _ => {}
+            }
+        }
+    }
+
+    let probe_col = probe_col.ok_or_else(|| anyhow!("RangeMergeJoin: no probe column found in predicates"))?;
+    let lower_col = lower_col.ok_or_else(|| anyhow!("RangeMergeJoin: no lower-bound column found"))?;
+    let upper_col = upper_col.ok_or_else(|| anyhow!("RangeMergeJoin: no upper-bound column found"))?;
+
+    let probe_idx = left_schema.get_index(&probe_col)
+        .ok_or_else(|| anyhow!("RangeMergeJoin: probe column '{}' not in left schema", probe_col))?;
+    let lower_idx = right_schema.get_index(&lower_col)
+        .ok_or_else(|| anyhow!("RangeMergeJoin: lower column '{}' not in right schema", lower_col))?;
+    let upper_idx = right_schema.get_index(&upper_col)
+        .ok_or_else(|| anyhow!("RangeMergeJoin: upper column '{}' not in right schema", upper_col))?;
+
+    Ok(RangeSpec { probe_idx, lower_idx, upper_idx, lower_inclusive, upper_inclusive })
+}
+
+pub struct RangeMergeJoinOperator {
+    left:  Box<dyn Operator>,
+    right: Box<dyn Operator>,
+    schema: Schema,
+    spec: RangeSpec,
+    memory_limit_bytes: u64,
+
+    initialized: bool,
+    done: bool,
+
+    cur_left:   Option<Row>,
+    active:     Vec<(Data, Row)>,  // (upper_bound_value, right_row)
+    active_idx: usize,             // next active entry to emit
+    right_peek: Option<Row>,       // next right row not yet inserted into active
+}
+
+impl RangeMergeJoinOperator {
+    pub fn new(
+        left:  Box<dyn Operator>,
+        right: Box<dyn Operator>,
+        memory_limit_bytes: u64,
+        predicates: Vec<Predicate>,
+    ) -> Result<Self> {
+        let schema = Schema::merge(left.schema(), right.schema());
+        let spec   = parse_range_spec(&predicates, left.schema(), right.schema())?;
+        Ok(RangeMergeJoinOperator {
+            left, right, schema, spec, memory_limit_bytes,
+            initialized: false, done: false,
+            cur_left: None, active: Vec::new(), active_idx: 0, right_peek: None,
+        })
+    }
+
+    fn get(row: &Row, idx: usize) -> Data {
+        row.get(idx).cloned().unwrap_or(Data::Int32(0))
+    }
+
+    /// True when B should be added to active (lower bound satisfied by probe).
+    fn should_add(&self, b_row: &Row, probe: &Data) -> bool {
+        let lower = Self::get(b_row, self.spec.lower_idx);
+        if self.spec.lower_inclusive {
+            lower.partial_cmp(probe).map_or(false, |o| o != std::cmp::Ordering::Greater) // lower <= probe
+        } else {
+            lower.partial_cmp(probe).map_or(false, |o| o == std::cmp::Ordering::Less)    // lower < probe
+        }
+    }
+
+    /// True when B should be evicted from active (upper bound no longer satisfied).
+    fn should_evict(upper: &Data, probe: &Data, upper_inclusive: bool) -> bool {
+        if upper_inclusive {
+            upper.partial_cmp(probe).map_or(false, |o| o == std::cmp::Ordering::Less) // upper < probe → evict
+        } else {
+            upper.partial_cmp(probe).map_or(false, |o| o != std::cmp::Ordering::Greater) // upper <= probe → evict
+        }
+    }
+
+    fn active_row_mem(row: &Row) -> usize {
+        let mut s = 48usize;
+        for v in row.values() {
+            s += match v { Data::String(sv) => 32 + sv.len(), _ => 32 };
+        }
+        s + std::mem::size_of::<Data>() // upper_bound clone
+    }
+
+    fn active_mem_budget(&self) -> usize {
+        const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
+        let avail = self.memory_limit_bytes.saturating_sub(PROCESS_OVERHEAD);
+        (avail as usize) * 40 / 100
+    }
+
+    /// Advance the active set for the current probe value:
+    ///   1. Add new right rows where lower (op) probe.
+    ///   2. Evict expired right rows where upper is no longer satisfied.
+    fn refresh_active(&mut self) -> Result<()> {
+        let probe = match self.cur_left.as_ref() {
+            Some(r) => Self::get(r, self.spec.probe_idx),
+            None    => return Ok(()),
+        };
+        let budget = self.active_mem_budget();
+
+        // Add right rows whose lower bound is satisfied
+        while let Some(ref rrow) = self.right_peek {
+            if !self.should_add(rrow, &probe) { break; }
+            // Check budget before inserting
+            let row_mem = Self::active_row_mem(rrow);
+            let current_mem: usize = self.active.iter()
+                .map(|(_, r)| Self::active_row_mem(r))
+                .sum();
+            if current_mem + row_mem > budget {
+                anyhow::bail!(
+                    "RangeMergeJoin: active set exceeds memory budget ({} bytes). \
+                     Interval overlap is too dense for the available memory limit.",
+                    budget
+                );
+            }
+            let upper = Self::get(rrow, self.spec.upper_idx);
+            let row   = self.right_peek.take().unwrap();
+            self.active.push((upper, row));
+            self.right_peek = self.right.next()?;
+        }
+
+        // Evict right rows whose upper bound is no longer satisfied
+        let inc = self.spec.upper_inclusive;
+        self.active.retain(|(upper, _)| !Self::should_evict(upper, &probe, inc));
+
+        self.active_idx = 0;
+        Ok(())
+    }
+
+    fn initialize(&mut self) -> Result<()> {
+        self.right_peek = self.right.next()?;
+        self.cur_left   = self.left.next()?;
+        if self.cur_left.is_some() {
+            self.refresh_active()?;
+        } else {
+            self.done = true;
+        }
+        self.initialized = true;
+        Ok(())
+    }
+}
+
+impl Operator for RangeMergeJoinOperator {
+    fn schema(&self) -> &Schema { &self.schema }
+
+    fn next(&mut self) -> Result<Option<Row>> {
+        if !self.initialized { self.initialize()?; }
+        if self.done { return Ok(None); }
+
+        loop {
+            // Emit next buffered match for cur_left
+            if self.active_idx < self.active.len() {
+                let right_row = self.active[self.active_idx].1.clone();
+                self.active_idx += 1;
+                let left_row = self.cur_left.as_ref().unwrap();
+                let mut values = left_row.values().to_vec();
+                values.extend_from_slice(right_row.values());
+                return Ok(Some(Row::new(values)));
+            }
+
+            // Active exhausted for cur_left — advance to next left row
+            self.cur_left = self.left.next()?;
+            match self.cur_left {
+                None    => { self.done = true; return Ok(None); }
+                Some(_) => { self.refresh_active()?; }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HashJoinOperator
 //
 // Phase 1 (initialize): consume the right child into a HashMap keyed by
@@ -1462,9 +1744,9 @@ pub struct HashJoinOperator<R: Read, W: Write> {
     // Grace Hash Join bookkeeping
     num_partitions:    usize,
     current_partition: usize,
-    left_partitions:   Vec<(u64, u64)>,   // (start_block, num_blocks) per partition
-    right_partitions:  Vec<(u64, u64)>,
-    left_reader:       Option<RunReader<R, W>>,
+    left_partitions:   Vec<Vec<u64>>,   // block ID list per partition
+    right_partitions:  Vec<Vec<u64>>,
+    left_reader:       Option<PartitionReader<R, W>>,
 }
 
 impl<R: Read, W: Write> HashJoinOperator<R, W> {
@@ -1581,11 +1863,11 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
 
     fn load_right_partition(&mut self, idx: usize) -> Result<()> {
         self.hash_table.clear();
-        let (start, n) = self.right_partitions[idx];
-        if n == 0 { return Ok(()); }
-        let mut reader = RunReader::new(
+        let block_ids = self.right_partitions[idx].clone();
+        if block_ids.is_empty() { return Ok(()); }
+        let mut reader = PartitionReader::new(
             self.disk_access.clone(), self.right_cols.clone(),
-            self.block_size, start, n,
+            self.block_size, block_ids,
         );
         while let Some(row) = reader.next_row()? {
             let key = Self::encode_key(&row, &self.right_key_idx);
@@ -1595,14 +1877,14 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
     }
 
     fn open_left_partition(&mut self, idx: usize) {
-        let (start, n) = self.left_partitions[idx];
-        self.left_reader = if n > 0 {
-            Some(RunReader::new(
-                self.disk_access.clone(), self.left_cols.clone(),
-                self.block_size, start, n,
-            ))
-        } else {
+        let block_ids = self.left_partitions[idx].clone();
+        self.left_reader = if block_ids.is_empty() {
             None
+        } else {
+            Some(PartitionReader::new(
+                self.disk_access.clone(), self.left_cols.clone(),
+                self.block_size, block_ids,
+            ))
         };
     }
 
@@ -1636,16 +1918,19 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
             // use_grace remains false; self.left streamed lazily in next()
         } else {
             // Grace Hash Join: partition both sides into GRACE_N disk buckets.
+            // Each row is routed to its partition's block buffer and flushed when
+            // full. Block IDs are recorded per-partition so the non-contiguous layout
+            // (multiple partitions sharing the allocator) can be read back correctly.
             const GRACE_N: usize = 32;
             self.num_partitions = GRACE_N;
             let usable = self.block_size as usize - 2;
 
             // ── Partition RIGHT side ──────────────────────────────────
             {
-                struct PBuf { blk: Vec<u8>, off: usize, cnt: u16, first: u64, total: u64 }
+                struct PBuf { blk: Vec<u8>, off: usize, cnt: u16, ids: Vec<u64> }
                 let mut parts: Vec<PBuf> = (0..GRACE_N).map(|_| PBuf {
                     blk: vec![0u8; self.block_size as usize],
-                    off: 0, cnt: 0, first: 0, total: 0,
+                    off: 0, cnt: 0, ids: Vec::new(),
                 }).collect();
 
                 let right_key  = self.right_key_idx.clone();
@@ -1662,9 +1947,9 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
                             let footer = pb.blk.len() - 2;
                             pb.blk[footer..].copy_from_slice(&pb.cnt.to_le_bytes());
                             let id = self.anon_allocator.allocate(1);
-                            if pb.total == 0 { pb.first = id; }
                             self.disk_access.lock().unwrap().write_blocks(id, 1, &pb.blk)?;
-                            pb.total += 1; pb.blk.fill(0); pb.off = 0; pb.cnt = 0;
+                            pb.ids.push(id);
+                            pb.blk.fill(0); pb.off = 0; pb.cnt = 0;
                         }
                         pb.blk[pb.off..pb.off + enc.len()].copy_from_slice(&enc);
                         pb.off += enc.len(); pb.cnt += 1;
@@ -1676,27 +1961,26 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
                 while let Some(row) = right_child.next()? { write_right!(row); }
                 drop(right_child);
 
-                let mut rp = Vec::with_capacity(GRACE_N);
+                let mut rp: Vec<Vec<u64>> = Vec::with_capacity(GRACE_N);
                 for pb in &mut parts {
                     if pb.cnt > 0 {
                         let footer = pb.blk.len() - 2;
                         pb.blk[footer..].copy_from_slice(&pb.cnt.to_le_bytes());
                         let id = self.anon_allocator.allocate(1);
-                        if pb.total == 0 { pb.first = id; }
                         self.disk_access.lock().unwrap().write_blocks(id, 1, &pb.blk)?;
-                        pb.total += 1;
+                        pb.ids.push(id);
                     }
-                    rp.push((pb.first, pb.total));
+                    rp.push(std::mem::take(&mut pb.ids));
                 }
                 self.right_partitions = rp;
             }
 
             // ── Partition LEFT side ───────────────────────────────────
             {
-                struct PBuf { blk: Vec<u8>, off: usize, cnt: u16, first: u64, total: u64 }
+                struct PBuf { blk: Vec<u8>, off: usize, cnt: u16, ids: Vec<u64> }
                 let mut parts: Vec<PBuf> = (0..GRACE_N).map(|_| PBuf {
                     blk: vec![0u8; self.block_size as usize],
-                    off: 0, cnt: 0, first: 0, total: 0,
+                    off: 0, cnt: 0, ids: Vec::new(),
                 }).collect();
 
                 let left_key  = self.left_key_idx.clone();
@@ -1712,25 +1996,24 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
                         let footer = pb.blk.len() - 2;
                         pb.blk[footer..].copy_from_slice(&pb.cnt.to_le_bytes());
                         let id = self.anon_allocator.allocate(1);
-                        if pb.total == 0 { pb.first = id; }
                         self.disk_access.lock().unwrap().write_blocks(id, 1, &pb.blk)?;
-                        pb.total += 1; pb.blk.fill(0); pb.off = 0; pb.cnt = 0;
+                        pb.ids.push(id);
+                        pb.blk.fill(0); pb.off = 0; pb.cnt = 0;
                     }
                     pb.blk[pb.off..pb.off + enc.len()].copy_from_slice(&enc);
                     pb.off += enc.len(); pb.cnt += 1;
                 }
 
-                let mut lp = Vec::with_capacity(GRACE_N);
+                let mut lp: Vec<Vec<u64>> = Vec::with_capacity(GRACE_N);
                 for pb in &mut parts {
                     if pb.cnt > 0 {
                         let footer = pb.blk.len() - 2;
                         pb.blk[footer..].copy_from_slice(&pb.cnt.to_le_bytes());
                         let id = self.anon_allocator.allocate(1);
-                        if pb.total == 0 { pb.first = id; }
                         self.disk_access.lock().unwrap().write_blocks(id, 1, &pb.blk)?;
-                        pb.total += 1;
+                        pb.ids.push(id);
                     }
-                    lp.push((pb.first, pb.total));
+                    lp.push(std::mem::take(&mut pb.ids));
                 }
                 self.left_partitions = lp;
             }
@@ -1743,6 +2026,53 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
 
         self.initialized = true;
         Ok(())
+    }
+
+    // Write a slice of rows to contiguous anonymous disk blocks and return
+    // (first_block_id, num_blocks). Blocks are allocated sequentially so
+    // RunReader can read them back with start_block + offset indexing.
+    fn write_rows_contiguous(
+        rows: &[Row],
+        cols: &[ColumnCatalog],
+        disk_access: &Arc<Mutex<DiskAccessLayer<R, W>>>,
+        block_size: u64,
+        anon_allocator: &AnonBlockAllocator,
+    ) -> Result<(u64, u64)> {
+        let usable = block_size as usize - 2;
+        let mut block_buf   = vec![0u8; block_size as usize];
+        let mut buf_offset  = 0usize;
+        let mut rows_in_blk = 0u16;
+        let mut total_blks  = 0u64;
+        let mut first_blk   = 0u64;
+        let mut got_first   = false;
+
+        for row in rows {
+            let encoded = encode_row(row, cols)?;
+            anyhow::ensure!(encoded.len() <= usable, "HashJoin: row too large for block");
+            if buf_offset + encoded.len() > usable {
+                let footer = block_buf.len() - 2;
+                block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
+                let id = anon_allocator.allocate(1);
+                if !got_first { first_blk = id; got_first = true; }
+                disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
+                total_blks += 1;
+                block_buf.fill(0); buf_offset = 0; rows_in_blk = 0;
+            }
+            block_buf[buf_offset..buf_offset + encoded.len()].copy_from_slice(&encoded);
+            buf_offset += encoded.len();
+            rows_in_blk += 1;
+        }
+
+        if rows_in_blk > 0 {
+            let footer = block_buf.len() - 2;
+            block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
+            let id = anon_allocator.allocate(1);
+            if !got_first { first_blk = id; }
+            disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
+            total_blks += 1;
+        }
+
+        Ok((first_blk, total_blks))
     }
 
     fn probe(&mut self, left_row: Row) {
@@ -1866,6 +2196,8 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
                     Ok(Box::new(SortMergeJoinOperator::new(left, right, disk_access, block_size, memory_limit_bytes, anon_allocator.clone(), d.predicates.clone())?)),
                 JoinAlgorithm::HashJoin =>
                     Ok(Box::new(HashJoinOperator::new(left, right, disk_access, block_size, memory_limit_bytes, anon_allocator.clone(), d.predicates.clone())?)),
+                JoinAlgorithm::RangeMerge =>
+                    Ok(Box::new(RangeMergeJoinOperator::new(left, right, memory_limit_bytes, d.predicates.clone())?)),
             }
         }
     }

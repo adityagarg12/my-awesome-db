@@ -243,7 +243,7 @@ fn build_join_tree(inputs: Vec<QueryOp>, predicates: Vec<Predicate>, catalog: &C
         let next_cols = col_sets.remove(next_pos);
 
         let new_joined: HashSet<String> = joined_cols.iter().cloned()
-            .chain(next_cols)
+            .chain(next_cols.iter().cloned())
             .collect();
 
         // Equi-join predicates now fully covered → go into the Join node.
@@ -258,26 +258,58 @@ fn build_join_tree(inputs: Vec<QueryOp>, predicates: Vec<Predicate>, catalog: &C
             .partition(|p| all_covered(p, &new_joined));
         rem_residual = leftover_res;
 
-        current = if applicable_eq.is_empty() {
-            QueryOp::Cross(CrossData {
+        if applicable_eq.is_empty() {
+            // No equi-join key — try to detect a range (band) join pattern before
+            // falling back to a plain Cross product.
+            if let Some((lo_idx, hi_idx)) = detect_range_join(&applicable_res, &joined_cols, &next_cols) {
+                let range_preds = vec![
+                    applicable_res[lo_idx].clone(),
+                    applicable_res[hi_idx].clone(),
+                ];
+                let other_res: Vec<Predicate> = applicable_res.into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != lo_idx && *i != hi_idx)
+                    .map(|(_, p)| p)
+                    .collect();
+                let join_node = QueryOp::Join(JoinData {
+                    left:       Box::new(current),
+                    right:      Box::new(next),
+                    predicates: range_preds,
+                    algorithm:  JoinAlgorithm::RangeMerge,
+                });
+                current = if !other_res.is_empty() {
+                    QueryOp::Filter(FilterData { underlying: Box::new(join_node), predicates: other_res })
+                } else {
+                    join_node
+                };
+                joined_cols = new_joined;
+                continue;
+            }
+            // No range pattern — plain Cross product; residuals become a Filter.
+            current = QueryOp::Cross(CrossData {
                 left:  Box::new(current),
                 right: Box::new(next),
-            })
+            });
+            if !applicable_res.is_empty() {
+                current = QueryOp::Filter(FilterData {
+                    underlying: Box::new(current),
+                    predicates: applicable_res,
+                });
+            }
         } else {
-            QueryOp::Join(JoinData {
+            current = QueryOp::Join(JoinData {
                 left:       Box::new(current),
                 right:      Box::new(next),
                 predicates: applicable_eq,
-                algorithm:  JoinAlgorithm::BNlj, // upgraded to SMJ by select_join_algorithm
-            })
-        };
-
-        // Apply residual (non-EQ) predicates as a Filter on top.
-        if !applicable_res.is_empty() {
-            current = QueryOp::Filter(FilterData {
-                underlying: Box::new(current),
-                predicates: applicable_res,
+                algorithm:  JoinAlgorithm::BNlj, // upgraded to SMJ/HashJoin by select_join_algorithm
             });
+            // Apply residual (non-EQ) predicates as a Filter on top.
+            if !applicable_res.is_empty() {
+                current = QueryOp::Filter(FilterData {
+                    underlying: Box::new(current),
+                    predicates: applicable_res,
+                });
+            }
         }
 
         joined_cols = new_joined;
@@ -293,6 +325,110 @@ fn build_join_tree(inputs: Vec<QueryOp>, predicates: Vec<Predicate>, catalog: &C
     }
 
     current
+}
+
+/// Detect a range (band) join pattern in `predicates` between `left_cols` and `right_cols`.
+///
+/// A range join requires two inequality predicates that together bound a single
+/// "probe" column (from one side) between a lower and upper column (from the other side):
+///
+///   probe > lower  AND  probe < upper   (GT + LT, or GTE + LTE, or mixed)
+///
+/// Both predicates must reference the same probe column.
+///
+/// Returns `Some((lower_idx, upper_idx))` — indices into `predicates` — on success.
+/// Returns `None` if no range join pattern is found.
+fn detect_range_join(
+    predicates: &[Predicate],
+    left_cols:  &HashSet<String>,
+    right_cols: &HashSet<String>,
+) -> Option<(usize, usize)> {
+    // Normalise each predicate to (probe_col, is_lower_bound, inclusive).
+    // "probe" is whichever column is being bounded; it must be on the left side.
+    // Returns None for predicates that can't be normalised (EQ, NE, literals).
+    struct Norm { probe: String, is_lower: bool }
+
+    let normed: Vec<Option<Norm>> = predicates.iter().map(|pred| {
+        let other = match &pred.value {
+            ComparisionValue::Column(c) => c,
+            _ => return None,
+        };
+
+        // Determine orientation: which side is the probe (single-column) and
+        // which side is the bound (interval endpoint).
+        let (probe, op_on_probe) =
+            if left_cols.contains(&pred.column_name) && right_cols.contains(other.as_str()) {
+                (pred.column_name.clone(), pred.operator.clone())
+            } else if right_cols.contains(&pred.column_name) && left_cols.contains(other.as_str()) {
+                // Flip: reverse the operator so probe is always the left-side column.
+                let flipped = match pred.operator {
+                    ComparisionOperator::GT  => ComparisionOperator::LT,
+                    ComparisionOperator::GTE => ComparisionOperator::LTE,
+                    ComparisionOperator::LT  => ComparisionOperator::GT,
+                    ComparisionOperator::LTE => ComparisionOperator::GTE,
+                    _ => return None,
+                };
+                (other.clone(), flipped)
+            } else {
+                return None;
+            };
+
+        let is_lower = match op_on_probe {
+            ComparisionOperator::GT | ComparisionOperator::GTE => true,   // probe > bound
+            ComparisionOperator::LT | ComparisionOperator::LTE => false,  // probe < bound
+            _ => return None, // EQ / NE are not range predicates
+        };
+        Some(Norm { probe, is_lower })
+    }).collect();
+
+    // Find a pair sharing the same probe column: one lower bound + one upper bound.
+    for i in 0..normed.len() {
+        if let Some(ref ni) = normed[i] {
+            for j in (i + 1)..normed.len() {
+                if let Some(ref nj) = normed[j] {
+                    if ni.probe == nj.probe && ni.is_lower != nj.is_lower {
+                        let (lower_idx, upper_idx) =
+                            if ni.is_lower { (i, j) } else { (j, i) };
+                        return Some((lower_idx, upper_idx));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract (probe_col_on_left, lower_col_on_right) from a RangeMerge join's predicates.
+/// Used by select_join_algorithm to know which Sort keys to inject.
+fn extract_range_sort_cols(
+    predicates: &[Predicate],
+    left:    &QueryOp,
+    right:   &QueryOp,
+    catalog: &Catalog,
+) -> (String, String) {
+    let left_set  = derive_columns_set(left,  catalog);
+    let right_set = derive_columns_set(right, catalog);
+
+    for pred in predicates {
+        let other = match &pred.value {
+            ComparisionValue::Column(c) => c,
+            _ => continue,
+        };
+        if left_set.contains(&pred.column_name) && right_set.contains(other.as_str()) {
+            // pred.column_name is probe (left), other is bound (right).
+            if matches!(pred.operator, ComparisionOperator::GT | ComparisionOperator::GTE) {
+                // probe > lower → lower_col = other
+                return (pred.column_name.clone(), other.clone());
+            }
+        }
+        if right_set.contains(&pred.column_name) && left_set.contains(other.as_str()) {
+            // pred.column_name (right) < other (left) → other is probe, pred.column_name is lower.
+            if matches!(pred.operator, ComparisionOperator::LT | ComparisionOperator::LTE) {
+                return (other.clone(), pred.column_name.clone());
+            }
+        }
+    }
+    (String::new(), String::new()) // no range predicate found (shouldn't happen)
 }
 
 fn push_selections(op: QueryOp, catalog: &Catalog) -> QueryOp {
@@ -395,6 +531,30 @@ fn make_sort_specs(key_cols: &[String]) -> Vec<SortSpec> {
 
 fn select_join_algorithm(op: QueryOp, catalog: &Catalog) -> QueryOp {
     let QueryOp::Join(mut d) = op else { return op; };
+
+    // Range Merge Join: already marked by build_join_tree.
+    // Inject Sort(left, probe_col) and Sort(right, lower_col) if not already sorted.
+    if matches!(d.algorithm, JoinAlgorithm::RangeMerge) {
+        let (probe_col, lower_col) =
+            extract_range_sort_cols(&d.predicates, &d.left, &d.right, catalog);
+        if !probe_col.is_empty() && !lower_col.is_empty() {
+            let probe_spec = vec![SortSpec { column_name: probe_col, ascending: true }];
+            let lower_spec = vec![SortSpec { column_name: lower_col, ascending: true }];
+            if !is_sorted_on(&d.left, &probe_spec) {
+                d.left = Box::new(QueryOp::Sort(SortData {
+                    underlying: d.left,
+                    sort_specs:  probe_spec,
+                }));
+            }
+            if !is_sorted_on(&d.right, &lower_spec) {
+                d.right = Box::new(QueryOp::Sort(SortData {
+                    underlying: d.right,
+                    sort_specs:  lower_spec,
+                }));
+            }
+        }
+        return QueryOp::Join(d);
+    }
 
     let (left_key, right_key) = extract_join_key_cols(&d.predicates, &d.left, &d.right, catalog);
 
