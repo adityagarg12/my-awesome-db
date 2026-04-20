@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 use common::DataType;
-use db_config::{DbContext, table::TableSpec};
+use db_config::{DbContext, statistics::ColumnStat, table::TableSpec};
 
 #[derive(Debug, Clone)]
 pub struct ColumnCatalog {
@@ -38,16 +38,31 @@ impl TableCatalog {
 pub struct Catalog {
     tables: Vec<TableCatalog>,
     table_name_to_index: HashMap<String, usize>,
+    /// (table_name, column_name) → stats list. Empty slice when not provided.
+    column_stats: HashMap<(String, String), Vec<ColumnStat>>,
 }
 
 impl Catalog {
     pub fn from_db_context(db_context: &DbContext) -> Result<Self> {
         let mut tables = Vec::new();
         let mut table_name_to_index = HashMap::new();
+        let mut column_stats: HashMap<(String, String), Vec<ColumnStat>> = HashMap::new();
 
         for table_spec in db_context.get_table_specs() {
             if table_name_to_index.contains_key(&table_spec.name) {
                 bail!("Duplicate table name '{}' in db config", table_spec.name);
+            }
+
+            // Collect column-level statistics while building the catalog.
+            for col_spec in &table_spec.column_specs {
+                if let Some(stats) = &col_spec.stats {
+                    if !stats.is_empty() {
+                        column_stats.insert(
+                            (table_spec.name.clone(), col_spec.column_name.clone()),
+                            stats.clone(),
+                        );
+                    }
+                }
             }
 
             let table_catalog = Self::build_table_catalog(table_spec)?;
@@ -59,7 +74,54 @@ impl Catalog {
         Ok(Self {
             tables,
             table_name_to_index,
+            column_stats,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // Statistics accessors
+    // -----------------------------------------------------------------------
+
+    /// All stats recorded for a specific (table, column) pair.
+    /// Returns an empty slice when the column has no statistics.
+    pub fn get_column_stats(&self, table_name: &str, column_name: &str) -> &[ColumnStat] {
+        self.column_stats
+            .get(&(table_name.to_string(), column_name.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Estimated total row count for a table (from any column's CardinalityStat).
+    /// Returns `None` when no cardinality stat is present.
+    pub fn get_table_cardinality(&self, table_name: &str) -> Option<u64> {
+        let table = self.get_table(table_name)?;
+        for col in table.columns() {
+            for stat in self.get_column_stats(table_name, &col.name) {
+                if let ColumnStat::CardinalityStat(c) = stat {
+                    return Some(c.0);
+                }
+            }
+        }
+        None
+    }
+
+    /// True when the column has the `IsPhysicallyOrdered` stat, meaning rows
+    /// arrive in ascending order of this column when the table is scanned
+    /// sequentially from disk.
+    pub fn is_column_physically_ordered(&self, table_name: &str, column_name: &str) -> bool {
+        self.get_column_stats(table_name, column_name)
+            .iter()
+            .any(|s| matches!(s, ColumnStat::IsPhysicallyOrdered))
+    }
+
+    /// DensityStat value for a column (NDV / total), if recorded.
+    pub fn get_column_density(&self, table_name: &str, column_name: &str) -> Option<f64> {
+        for stat in self.get_column_stats(table_name, column_name) {
+            if let ColumnStat::DensityStat(d) = stat {
+                return Some(d.0 as f64);
+            }
+        }
+        None
     }
 
     pub fn get_table(&self, table_name: &str) -> Option<&TableCatalog> {
