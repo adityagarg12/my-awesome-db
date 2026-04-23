@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Query {
     pub root: QueryOp,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ComparisionOperator {
     EQ,
     NE,
@@ -15,7 +15,7 @@ pub enum ComparisionOperator {
     LTE,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ComparisionValue {
     Column(String),
     I32(i32),
@@ -25,53 +25,76 @@ pub enum ComparisionValue {
     String(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Predicate {
     pub column_name: String,
     pub operator: ComparisionOperator,
     pub value: ComparisionValue,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilterData {
     pub predicates: Vec<Predicate>,
     pub underlying: Box<QueryOp>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectData {
     pub column_name_map: Vec<(String, String)>,
     pub underlying: Box<QueryOp>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrossData {
     pub left: Box<QueryOp>,
     pub right: Box<QueryOp>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Which physical join algorithm to use for a Join node.
+/// Set by the optimizer; defaults to BNlj.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum JoinAlgorithm {
+    /// Block Nested-Loop Join — right side spilled to disk, left chunked in RAM.
+    BNlj,
+    /// Sort-Merge Join — both inputs must arrive pre-sorted on the join key.
+    SortMerge,
+}
+
+/// Optimizer-internal node: never appears in the input query tree.
+/// Produced by rewriting Filter(Cross(...)) when join predicates are found.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinData {
+    pub left: Box<QueryOp>,
+    pub right: Box<QueryOp>,
+    pub predicates: Vec<Predicate>,
+    pub algorithm: JoinAlgorithm,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SortSpec {
     pub column_name: String,
     pub ascending: bool,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SortData {
     pub sort_specs: Vec<SortSpec>,
     pub underlying: Box<QueryOp>,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanData {
     pub table_id: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum QueryOp {
     Filter(FilterData),
     Project(ProjectData),
     Cross(CrossData),
     Sort(SortData),
     Scan(ScanData),
+    /// Optimizer-internal: B-NLJ join with pushed-down predicates.
+    /// Never present in the input query; produced by the optimizer.
+    Join(JoinData),
 }
 
 impl QueryOp {
