@@ -3,11 +3,57 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use anyhow::{Result, anyhow};
 use common::{Data, DataType};
-use common::query::{ComparisionOperator, ComparisionValue, JoinAlgorithm, JoinData, Predicate, QueryOp, SortSpec};
+use common::query::{ComparisionOperator, ComparisionValue, JoinAlgorithm, Predicate, QueryOp, SortSpec};
 use crate::catalog::{Catalog, ColumnCatalog, TableCatalog};
 use crate::disk_access::DiskAccessLayer;
 use crate::row::{Row, data_compare, encode_row};
-use crate::block_codec::{decode_block, encode_rows_to_blocks};
+use crate::block_codec::decode_block;
+
+const MAX_IO_BATCH_BLOCKS: u64 = 64;
+
+fn io_batch_blocks(memory_limit_bytes: u64, block_size: u64) -> u64 {
+    if block_size == 0 {
+        return 1;
+    }
+
+    // Keep large safety headroom for process image + stack + operator state.
+    const PROCESS_SAFETY_MARGIN: u64 = 40 * 1024 * 1024;
+    // Hard-cap batching buffers to 256 KB so they never dominate memory.
+    const MAX_BATCH_BYTES: u64 = 256 * 1024;
+
+    let available = memory_limit_bytes.saturating_sub(PROCESS_SAFETY_MARGIN);
+    // At most ~3.1% of post-margin budget goes to a batch buffer.
+    let budget = (available / 32).min(MAX_BATCH_BYTES).max(block_size);
+    (budget / block_size).clamp(1, MAX_IO_BATCH_BLOCKS)
+}
+
+fn flush_pending_blocks<R: Read, W: Write>(
+    disk_access: &Arc<Mutex<DiskAccessLayer<R, W>>>,
+    anon_allocator: &AnonBlockAllocator,
+    first_block: &mut Option<u64>,
+    total_blocks: &mut u64,
+    pending_blocks: &mut u64,
+    pending_bytes: &mut Vec<u8>,
+) -> Result<()> {
+    if *pending_blocks == 0 {
+        return Ok(());
+    }
+
+    let start = anon_allocator.allocate(*pending_blocks);
+    if first_block.is_none() {
+        *first_block = Some(start);
+    }
+
+    disk_access
+        .lock()
+        .unwrap()
+        .write_blocks(start, *pending_blocks, pending_bytes)?;
+
+    *total_blocks += *pending_blocks;
+    *pending_blocks = 0;
+    pending_bytes.clear();
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -124,6 +170,10 @@ pub struct ScanOperator<R: Read, W: Write> {
     current_block_offset: u64,
     current_rows: Vec<Row>,
     current_row_idx: usize,
+    prefetched_blocks: Vec<u8>,
+    prefetched_block_count: u64,
+    prefetched_next_block: u64,
+    io_read_batch_blocks: u64,
     initialized: bool,
 }
 
@@ -132,6 +182,7 @@ impl<R: Read, W: Write> ScanOperator<R, W> {
         disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
         table: &TableCatalog,
         block_size: u64,
+        memory_limit_bytes: u64,
     ) -> Self {
         ScanOperator {
             disk_access,
@@ -143,6 +194,10 @@ impl<R: Read, W: Write> ScanOperator<R, W> {
             current_block_offset: 0,
             current_rows: Vec::new(),
             current_row_idx: 0,
+            prefetched_blocks: Vec::new(),
+            prefetched_block_count: 0,
+            prefetched_next_block: 0,
+            io_read_batch_blocks: io_batch_blocks(memory_limit_bytes, block_size),
             initialized: false,
         }
     }
@@ -161,13 +216,25 @@ impl<R: Read, W: Write> ScanOperator<R, W> {
         if self.current_block_offset >= self.num_blocks {
             return Ok(false);
         }
-        let block_id = self.start_block + self.current_block_offset;
-        let block_data = {
-            let mut disk = self.disk_access.lock().unwrap();
-            disk.read_blocks(block_id, 1)?
-        };
-        self.current_rows = decode_block(&block_data, self.block_size, self.schema.columns())?;
+
+        if self.prefetched_next_block >= self.prefetched_block_count {
+            let remaining = self.num_blocks - self.current_block_offset;
+            let to_read = remaining.min(self.io_read_batch_blocks);
+            let block_id = self.start_block + self.current_block_offset;
+            self.prefetched_blocks = {
+                let mut disk = self.disk_access.lock().unwrap();
+                disk.read_blocks(block_id, to_read)?
+            };
+            self.prefetched_block_count = to_read;
+            self.prefetched_next_block = 0;
+        }
+
+        let bs = self.block_size as usize;
+        let off = self.prefetched_next_block as usize * bs;
+        let block_data = &self.prefetched_blocks[off..off + bs];
+        self.current_rows = decode_block(block_data, self.block_size, self.schema.columns())?;
         self.current_row_idx = 0;
+        self.prefetched_next_block += 1;
         self.current_block_offset += 1;
         Ok(true)
     }
@@ -334,6 +401,9 @@ pub struct CrossOperator<R: Read, W: Write> {
     right_block_rows: Vec<Row>,     // decoded rows from current right block
     right_row_idx: usize,           // which row inside right_block_rows
     left_chunk_idx: usize,          // which left_chunk row to pair with current right row
+    right_prefetch_start_offset: u64,
+    right_prefetch_block_count: u64,
+    right_prefetch_blocks: Vec<u8>,
 }
 
 impl<R: Read, W: Write> CrossOperator<R, W> {
@@ -358,6 +428,9 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
             right_block_offset: 0,
             right_block_rows: Vec::new(),
             right_row_idx: 0, left_chunk_idx: 0,
+            right_prefetch_start_offset: 0,
+            right_prefetch_block_count: 0,
+            right_prefetch_blocks: Vec::new(),
         }
     }
 
@@ -431,14 +504,17 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
     // ------------------------------------------------------------------
     fn spill_right(&mut self) -> Result<()> {
         let mut right_child = self.right.take().unwrap();
+        let io_write_batch_blocks = io_batch_blocks(self.memory_limit_bytes, self.block_size);
         let usable = self.block_size as usize - 2;
 
         let mut block_buf      = vec![0u8; self.block_size as usize];
         let mut buf_offset     = 0usize;
         let mut rows_in_block  = 0u16;
         let mut total_blocks   = 0u64;
-        let mut first_block    = 0u64;
-        let mut got_first      = false;
+        let mut first_block: Option<u64> = None;
+        let mut pending_blocks = 0u64;
+        let mut pending_bytes: Vec<u8> =
+            Vec::with_capacity((self.block_size * io_write_batch_blocks) as usize);
         let mut has_any_row    = false;
 
         while let Some(row) = right_child.next()? {
@@ -455,10 +531,18 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
                 // Flush current block to disk
                 let footer = block_buf.len() - 2;
                 block_buf[footer..].copy_from_slice(&rows_in_block.to_le_bytes());
-                let id = self.anon_allocator.allocate(1);
-                if !got_first { first_block = id; got_first = true; }
-                self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
-                total_blocks += 1;
+                pending_bytes.extend_from_slice(&block_buf);
+                pending_blocks += 1;
+                if pending_blocks >= io_write_batch_blocks {
+                    flush_pending_blocks(
+                        &self.disk_access,
+                        &self.anon_allocator,
+                        &mut first_block,
+                        &mut total_blocks,
+                        &mut pending_blocks,
+                        &mut pending_bytes,
+                    )?;
+                }
                 block_buf.fill(0); buf_offset = 0; rows_in_block = 0;
             }
 
@@ -475,12 +559,18 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
         // Flush the final (possibly partial) block
         let footer = block_buf.len() - 2;
         block_buf[footer..].copy_from_slice(&rows_in_block.to_le_bytes());
-        let id = self.anon_allocator.allocate(1);
-        if !got_first { first_block = id; }
-        self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
-        total_blocks += 1;
+        pending_bytes.extend_from_slice(&block_buf);
+        pending_blocks += 1;
+        flush_pending_blocks(
+            &self.disk_access,
+            &self.anon_allocator,
+            &mut first_block,
+            &mut total_blocks,
+            &mut pending_blocks,
+            &mut pending_bytes,
+        )?;
 
-        self.right_start_block = first_block;
+        self.right_start_block = first_block.expect("spill_right: first block must exist");
         self.right_num_blocks  = total_blocks;
         Ok(())
     }
@@ -504,9 +594,22 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
 
     /// Load right block at `offset` into right_block_rows; reset right_row_idx.
     fn load_right_block(&mut self, offset: u64) -> Result<()> {
-        let id   = self.right_start_block + offset;
-        let data = { self.disk_access.lock().unwrap().read_blocks(id, 1)? };
-        self.right_block_rows = decode_block(&data, self.block_size, &self.right_cols)?;
+        let in_window = offset >= self.right_prefetch_start_offset
+            && offset < self.right_prefetch_start_offset + self.right_prefetch_block_count;
+        if !in_window {
+            let remaining = self.right_num_blocks.saturating_sub(offset);
+            let to_read = remaining.min(io_batch_blocks(self.memory_limit_bytes, self.block_size));
+            let id = self.right_start_block + offset;
+            self.right_prefetch_blocks = self.disk_access.lock().unwrap().read_blocks(id, to_read)?;
+            self.right_prefetch_start_offset = offset;
+            self.right_prefetch_block_count = to_read;
+        }
+
+        let bs = self.block_size as usize;
+        let idx = (offset - self.right_prefetch_start_offset) as usize;
+        let lo = idx * bs;
+        let hi = lo + bs;
+        self.right_block_rows = decode_block(&self.right_prefetch_blocks[lo..hi], self.block_size, &self.right_cols)?;
         self.right_row_idx    = 0;
         Ok(())
     }
@@ -593,6 +696,10 @@ struct RunReader<R: Read, W: Write> {
     start_block: u64,
     num_blocks: u64,
     blocks_read: u64,
+    prefetched_blocks: Vec<u8>,
+    prefetched_count: u64,
+    prefetched_next: u64,
+    io_read_batch_blocks: u64,
     current_rows: Vec<Row>,
     row_idx: usize,
 }
@@ -604,9 +711,13 @@ impl<R: Read, W: Write> RunReader<R, W> {
         block_size: u64,
         start_block: u64,
         num_blocks: u64,
+        memory_limit_bytes: u64,
     ) -> Self {
         RunReader { disk_access, columns, block_size, start_block, num_blocks,
-                    blocks_read: 0, current_rows: Vec::new(), row_idx: 0 }
+                    blocks_read: 0,
+                    prefetched_blocks: Vec::new(), prefetched_count: 0, prefetched_next: 0,
+                    io_read_batch_blocks: io_batch_blocks(memory_limit_bytes, block_size),
+                    current_rows: Vec::new(), row_idx: 0 }
     }
 
     fn next_row(&mut self) -> Result<Option<Row>> {
@@ -619,13 +730,25 @@ impl<R: Read, W: Write> RunReader<R, W> {
             if self.blocks_read >= self.num_blocks {
                 return Ok(None);
             }
-            let block_id = self.start_block + self.blocks_read;
-            let data = {
-                let mut disk = self.disk_access.lock().unwrap();
-                disk.read_blocks(block_id, 1)?
-            };
-            self.current_rows = decode_block(&data, self.block_size, &self.columns)?;
+
+            if self.prefetched_next >= self.prefetched_count {
+                let remain = self.num_blocks - self.blocks_read;
+                let to_read = remain.min(self.io_read_batch_blocks);
+                let block_id = self.start_block + self.blocks_read;
+                self.prefetched_blocks = {
+                    let mut disk = self.disk_access.lock().unwrap();
+                    disk.read_blocks(block_id, to_read)?
+                };
+                self.prefetched_count = to_read;
+                self.prefetched_next = 0;
+            }
+
+            let bs = self.block_size as usize;
+            let lo = self.prefetched_next as usize * bs;
+            let hi = lo + bs;
+            self.current_rows = decode_block(&self.prefetched_blocks[lo..hi], self.block_size, &self.columns)?;
             self.row_idx = 0;
+            self.prefetched_next += 1;
             self.blocks_read += 1;
         }
     }
@@ -734,6 +857,7 @@ impl<R: Read, W: Write> SortOperator<R, W> {
     ///
     /// Peak additional memory: block_size (negligible).
     fn write_run(&self, rows: &[Row]) -> Result<(u64, u64)> {
+        let io_write_batch_blocks = io_batch_blocks(self.memory_limit_bytes, self.block_size);
         let cols   = self.schema.columns();
         let usable = self.block_size as usize - 2;
 
@@ -741,8 +865,10 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         let mut buf_offset  = 0usize;
         let mut rows_in_blk = 0u16;
         let mut total_blks  = 0u64;
-        let mut first_blk   = 0u64;
-        let mut got_first   = false;
+        let mut first_blk: Option<u64> = None;
+        let mut pending_blocks = 0u64;
+        let mut pending_bytes: Vec<u8> =
+            Vec::with_capacity((self.block_size * io_write_batch_blocks) as usize);
 
         for row in rows {
             let enc = encode_row(row, cols)?;
@@ -756,10 +882,18 @@ impl<R: Read, W: Write> SortOperator<R, W> {
                 // Flush full block
                 let footer = block_buf.len() - 2;
                 block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
-                let id = self.anon_allocator.allocate(1);
-                if !got_first { first_blk = id; got_first = true; }
-                self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
-                total_blks += 1;
+                pending_bytes.extend_from_slice(&block_buf);
+                pending_blocks += 1;
+                if pending_blocks >= io_write_batch_blocks {
+                    flush_pending_blocks(
+                        &self.disk_access,
+                        &self.anon_allocator,
+                        &mut first_blk,
+                        &mut total_blks,
+                        &mut pending_blocks,
+                        &mut pending_bytes,
+                    )?;
+                }
                 block_buf.fill(0); buf_offset = 0; rows_in_blk = 0;
             }
             block_buf[buf_offset..buf_offset + enc.len()].copy_from_slice(&enc);
@@ -771,13 +905,19 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         if rows_in_blk > 0 {
             let footer = block_buf.len() - 2;
             block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
-            let id = self.anon_allocator.allocate(1);
-            if !got_first { first_blk = id; }
-            self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
-            total_blks += 1;
+            pending_bytes.extend_from_slice(&block_buf);
+            pending_blocks += 1;
+            flush_pending_blocks(
+                &self.disk_access,
+                &self.anon_allocator,
+                &mut first_blk,
+                &mut total_blks,
+                &mut pending_blocks,
+                &mut pending_bytes,
+            )?;
         }
 
-        Ok((first_blk, total_blks))
+        Ok((first_blk.expect("write_run: first block must exist"), total_blks))
     }
 
     fn make_heap_key(&self, row: &Row) -> Vec<(Data, bool)> {
@@ -822,9 +962,11 @@ impl<R: Read, W: Write> SortOperator<R, W> {
 
         let mut readers: Vec<RunReader<R, W>> = run_specs.iter()
             .map(|&(start, n)| RunReader::new(
-                self.disk_access.clone(), cols.clone(), self.block_size, start, n,
+                self.disk_access.clone(), cols.clone(), self.block_size, start, n, self.memory_limit_bytes,
             ))
             .collect();
+
+        let io_write_batch_blocks = io_batch_blocks(self.memory_limit_bytes, self.block_size);
 
         let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
         for (i, reader) in readers.iter_mut().enumerate() {
@@ -839,8 +981,10 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         let mut buf_offset  = 0usize;
         let mut rows_in_blk = 0u16;
         let mut total_blks  = 0u64;
-        let mut first_blk   = 0u64;
-        let mut got_first   = false;
+        let mut first_blk: Option<u64> = None;
+        let mut pending_blocks = 0u64;
+        let mut pending_bytes: Vec<u8> =
+            Vec::with_capacity((self.block_size * io_write_batch_blocks) as usize);
 
         while let Some(entry) = heap.pop() {
             let run_idx = entry.run_idx;
@@ -861,10 +1005,18 @@ impl<R: Read, W: Write> SortOperator<R, W> {
                 // Flush full block
                 let footer = block_buf.len() - 2;
                 block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
-                let id = self.anon_allocator.allocate(1);
-                if !got_first { first_blk = id; got_first = true; }
-                self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
-                total_blks += 1;
+                pending_bytes.extend_from_slice(&block_buf);
+                pending_blocks += 1;
+                if pending_blocks >= io_write_batch_blocks {
+                    flush_pending_blocks(
+                        &self.disk_access,
+                        &self.anon_allocator,
+                        &mut first_blk,
+                        &mut total_blks,
+                        &mut pending_blocks,
+                        &mut pending_bytes,
+                    )?;
+                }
                 block_buf.fill(0); buf_offset = 0; rows_in_blk = 0;
             }
 
@@ -877,13 +1029,19 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         if rows_in_blk > 0 {
             let footer = block_buf.len() - 2;
             block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
-            let id = self.anon_allocator.allocate(1);
-            if !got_first { first_blk = id; }
-            self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
-            total_blks += 1;
+            pending_bytes.extend_from_slice(&block_buf);
+            pending_blocks += 1;
+            flush_pending_blocks(
+                &self.disk_access,
+                &self.anon_allocator,
+                &mut first_blk,
+                &mut total_blks,
+                &mut pending_blocks,
+                &mut pending_bytes,
+            )?;
         }
 
-        Ok((first_blk, total_blks))
+        Ok((first_blk.expect("merge_runs_to_disk: first block must exist"), total_blks))
     }
 
     /// Prime the final streaming merge heap from `self.run_readers`.
@@ -979,7 +1137,7 @@ impl<R: Read, W: Write> SortOperator<R, W> {
             let cols = self.schema.columns().to_vec();
             for (start, n) in runs {
                 self.run_readers.push(RunReader::new(
-                    self.disk_access.clone(), cols.clone(), self.block_size, start, n,
+                    self.disk_access.clone(), cols.clone(), self.block_size, start, n, self.memory_limit_bytes,
                 ));
             }
             self.prime_merge_heap()?;
@@ -1197,6 +1355,7 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
     /// On overflow, spill ALL accumulated rows (and remaining ones) to disk.
     /// After this call `right_peek` holds the first non-matching right row (or None).
     fn load_right_group(&mut self, first_row: Row) -> Result<()> {
+        let io_write_batch_blocks = io_batch_blocks(self.memory_limit_bytes, self.block_size);
         let key      = self.extract_right_key(&first_row);
         let max_rows = self.max_right_group_rows();
 
@@ -1232,18 +1391,29 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
         let mut buf_offset  = 0usize;
         let mut rows_in_blk = 0u16;
         let mut total_blks  = 0u64;
-        let mut first_blk   = 0u64;
-        let mut got_first   = false;
+        let mut first_blk: Option<u64> = None;
+        let mut pending_blocks = 0u64;
+        let mut pending_bytes: Vec<u8> =
+            Vec::with_capacity((self.block_size * io_write_batch_blocks) as usize);
 
-        // Inline flush helper via a labelled block (avoids borrow conflicts)
+        // Inline flush helper via a macro keeps borrow checker happy and the
+        // pending write buffer bounded by io_write_batch_blocks.
         macro_rules! flush_block {
             () => {{
                 let footer = block_buf.len() - 2;
                 block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
-                let id = self.anon_allocator.allocate(1);
-                if !got_first { first_blk = id; got_first = true; }
-                self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
-                total_blks += 1;
+                pending_bytes.extend_from_slice(&block_buf);
+                pending_blocks += 1;
+                if pending_blocks >= io_write_batch_blocks {
+                    flush_pending_blocks(
+                        &self.disk_access,
+                        &self.anon_allocator,
+                        &mut first_blk,
+                        &mut total_blks,
+                        &mut pending_blocks,
+                        &mut pending_bytes,
+                    )?;
+                }
                 block_buf.fill(0); buf_offset = 0; rows_in_blk = 0;
             }};
         }
@@ -1272,12 +1442,20 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
         }
 
         if rows_in_blk > 0 { flush_block!(); }
+        flush_pending_blocks(
+            &self.disk_access,
+            &self.anon_allocator,
+            &mut first_blk,
+            &mut total_blks,
+            &mut pending_blocks,
+            &mut pending_bytes,
+        )?;
 
-        self.right_group_start_block = first_blk;
+        self.right_group_start_block = first_blk.expect("load_right_group: first block must exist");
         self.right_group_num_blocks  = total_blks;
         self.right_group_disk_reader = Some(RunReader::new(
             self.disk_access.clone(), self.right_cols.clone(),
-            self.block_size, first_blk, total_blks,
+            self.block_size, self.right_group_start_block, total_blks, self.memory_limit_bytes,
         ));
         Ok(())
     }
@@ -1289,7 +1467,7 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
             self.right_group_disk_reader = Some(RunReader::new(
                 self.disk_access.clone(), self.right_cols.clone(),
                 self.block_size,
-                self.right_group_start_block, self.right_group_num_blocks,
+                self.right_group_start_block, self.right_group_num_blocks, self.memory_limit_bytes,
             ));
         } else {
             self.right_group_idx = 0;
@@ -1434,7 +1612,7 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
         QueryOp::Scan(d) => {
             let table = catalog.get_table(&d.table_id)
                 .ok_or_else(|| anyhow!("Scan: table '{}' not found", d.table_id))?;
-            Ok(Box::new(ScanOperator::new(disk_access, table, block_size)))
+            Ok(Box::new(ScanOperator::new(disk_access, table, block_size, memory_limit_bytes)))
         }
 
         QueryOp::Filter(d) => {
@@ -1476,6 +1654,8 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
                     Ok(Box::new(CrossOperator::new(left, right, disk_access, block_size, memory_limit_bytes, anon_allocator.clone(), d.predicates.clone()))),
                 JoinAlgorithm::SortMerge =>
                     Ok(Box::new(SortMergeJoinOperator::new(left, right, disk_access, block_size, memory_limit_bytes, anon_allocator.clone(), d.predicates.clone())?)),
+                _ =>
+                    Ok(Box::new(CrossOperator::new(left, right, disk_access, block_size, memory_limit_bytes, anon_allocator.clone(), d.predicates.clone()))),
             }
         }
     }

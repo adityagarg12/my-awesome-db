@@ -50,11 +50,23 @@ fn db_main() -> Result<()> {
     let memory_limit_mb: u64 = line.trim().parse().context("Failed to parse memory limit")?;
     let memory_limit_bytes = memory_limit_mb * 1024 * 1024;
 
+    // Keep substantial headroom for process image, stack, allocator metadata,
+    // and operator working buffers. Buffer pool stays intentionally small.
+    const PROCESS_OVERHEAD_MARGIN: u64 = 40 * 1024 * 1024;
+    const BUFFER_POOL_HARD_CAP: u64 = 2 * 1024 * 1024;
+    let buffer_pool_bytes = memory_limit_bytes
+        .saturating_sub(PROCESS_OVERHEAD_MARGIN)
+        .min(BUFFER_POOL_HARD_CAP);
+
     // 3. Get block size and anonymous-region start from disk
     let block_size = {
         let mut disk = disk_access.lock().unwrap();
         disk.get_block_size()?
     };
+    if buffer_pool_bytes >= block_size {
+        let mut disk = disk_access.lock().unwrap();
+        disk.configure_buffer_pool(buffer_pool_bytes)?;
+    }
     let anon_start = {
         let mut disk = disk_access.lock().unwrap();
         disk.get_anon_start_block()?
