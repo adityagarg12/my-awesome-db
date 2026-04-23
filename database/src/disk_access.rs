@@ -40,10 +40,18 @@ impl BlockCache {
         self.lru.push_back(block_id);
     }
 
-    fn get(&mut self, block_id: u64) -> Option<Vec<u8>> {
-        let data = self.map.get(&block_id)?.clone();
+    fn contains(&self, block_id: u64) -> bool {
+        self.map.contains_key(&block_id)
+    }
+
+    fn get_copy_into(&mut self, block_id: u64, dst: &mut [u8]) -> bool {
+        let Some(data) = self.map.get(&block_id) else { return false; };
+        if data.len() != dst.len() {
+            return false;
+        }
+        dst.copy_from_slice(data);
         self.touch(block_id);
-        Some(data)
+        true
     }
 
     fn put(&mut self, block_id: u64, data: Vec<u8>) {
@@ -147,9 +155,8 @@ impl<R: Read, W: Write> DiskAccessLayer<R, W> {
             let block_id = start_block_id + i;
 
             if let Some(cache) = self.cache.as_mut() {
-                if let Some(cached_block) = cache.get(block_id) {
-                    let dst = (i as usize) * bs;
-                    bytes[dst..dst + bs].copy_from_slice(&cached_block);
+                let dst = (i as usize) * bs;
+                if cache.get_copy_into(block_id, &mut bytes[dst..dst + bs]) {
                     i += 1;
                     continue;
                 }
@@ -158,11 +165,7 @@ impl<R: Read, W: Write> DiskAccessLayer<R, W> {
             let mut run_len = 1u64;
             while i + run_len < num_blocks {
                 let next_id = start_block_id + i + run_len;
-                let cached = self
-                    .cache
-                    .as_mut()
-                    .and_then(|c| c.get(next_id))
-                    .is_some();
+                let cached = self.cache.as_ref().is_some_and(|c| c.contains(next_id));
                 if cached {
                     break;
                 }

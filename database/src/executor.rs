@@ -10,6 +10,8 @@ use crate::row::{Row, data_compare, encode_row};
 use crate::block_codec::decode_block;
 
 const MAX_IO_BATCH_BLOCKS: u64 = 64;
+const STRING_CELL_MEM_ESTIMATE: usize = 64;
+const SCALAR_CELL_MEM_ESTIMATE: usize = 32;
 
 fn io_batch_blocks(memory_limit_bytes: u64, block_size: u64) -> u64 {
     if block_size == 0 {
@@ -466,7 +468,10 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
     fn left_row_size(&self) -> usize {
         let mut s = 24usize;
         for col in self.left.schema().columns() {
-            s += match col.data_type { DataType::String => 64, _ => 32 };
+            s += match col.data_type {
+                DataType::String => STRING_CELL_MEM_ESTIMATE,
+                _ => SCALAR_CELL_MEM_ESTIMATE,
+            };
         }
         s
     }
@@ -496,7 +501,7 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
         let available = self.memory_limit_bytes
             .saturating_sub(PROCESS_OVERHEAD)
             .saturating_sub(right_buf);
-        (available as usize / self.left_row_size()).max(64)
+        (available as usize / self.left_row_size()).max(1)
     }
 
     // ------------------------------------------------------------------
@@ -704,6 +709,10 @@ struct RunReader<R: Read, W: Write> {
     row_idx: usize,
 }
 
+// 4-block prefetch gives 4× fewer lock+read calls vs batch=1 while keeping
+// per-reader memory well within what merge_fan_in accounts for.
+const RUN_READER_BATCH_BLOCKS: u64 = 4;
+
 impl<R: Read, W: Write> RunReader<R, W> {
     fn new(
         disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
@@ -711,12 +720,12 @@ impl<R: Read, W: Write> RunReader<R, W> {
         block_size: u64,
         start_block: u64,
         num_blocks: u64,
-        memory_limit_bytes: u64,
+        _memory_limit_bytes: u64,
     ) -> Self {
         RunReader { disk_access, columns, block_size, start_block, num_blocks,
                     blocks_read: 0,
                     prefetched_blocks: Vec::new(), prefetched_count: 0, prefetched_next: 0,
-                    io_read_batch_blocks: io_batch_blocks(memory_limit_bytes, block_size),
+                    io_read_batch_blocks: RUN_READER_BATCH_BLOCKS,
                     current_rows: Vec::new(), row_idx: 0 }
     }
 
@@ -827,8 +836,8 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         let mut size = 24usize; // Vec<Data> header
         for col in self.schema.columns() {
             size += match col.data_type {
-                DataType::String => 64, // Data enum (32) + heap string estimate (32)
-                _                => 32, // Data enum size (largest variant)
+                DataType::String => STRING_CELL_MEM_ESTIMATE,
+                _                => SCALAR_CELL_MEM_ESTIMATE,
             };
         }
         size
@@ -941,15 +950,27 @@ impl<R: Read, W: Write> SortOperator<R, W> {
     ///   fan_in   =  (available − block_size) / per_run
     /// 
     fn merge_fan_in(&self) -> usize {
-        // to be check
+        // Keep fan-in conservative to bound heap and RunReader memory.
+        // Query 9 on larger datasets can produce many runs; opening too many
+        // readers in one pass is a common OOM trigger.
         const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
+        const MAX_MERGE_FAN_IN: usize = 32;
         let available = self.memory_limit_bytes
             .saturating_sub(PROCESS_OVERHEAD)
             .saturating_sub(self.block_size) as usize;
-        //TO BE CHECK
-        let key_size  = 24 + self.sort_specs.len() * 40; // Vec header (24) + (Data,bool) per col (40)
-        let per_run   = self.block_size as usize + key_size;
-        (available / per_run.max(1)).max(2)
+
+        let key_size = 24 + self.sort_specs.len() * 40;
+        // per_run = full in-memory footprint of one open RunReader:
+        //   prefetched_blocks : RUN_READER_BATCH_BLOCKS × block_size
+        //   current_rows      : ~1 decoded block (+1 spare = +2 total)
+        //   HeapEntry.key     : key_size
+        //   decoded row data  : row_mem_estimate × 2
+        let per_run = (self.block_size as usize * (RUN_READER_BATCH_BLOCKS as usize + 2))
+            + key_size
+            + (self.row_mem_estimate() * 2)
+            + 128;
+
+        (available / per_run.max(1)).clamp(2, MAX_MERGE_FAN_IN)
     }
 
     /// Merge `run_specs` sorted runs into one new sorted run written to
@@ -1063,12 +1084,11 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         // memory = one block_size buffer ≈ 4 KB), so we no longer need to
         // reserve half the budget for a monolithic encoded Vec.
         //
-        // Budget = 70 % of memory available after subtracting process overhead.
-        // The remaining 30 % covers:
-        //   - one block_size write buffer during write_run (≈ 4 KB)
-        //   - RunReader blocks during the merge phase (fan_in × block_size)
-        //   - SMJ right-group rows held by parent operators
-        //   - Other heap allocations in the pipeline
+        // Budget = 63 % of memory available after subtracting process overhead.
+        // The merge phase uses at most
+        //   MAX_MERGE_FAN_IN × (RUN_READER_BATCH_BLOCKS+2) × block_size ≈ 1.5 MB
+        // so 37 % headroom easily covers that, the write-run batch buffer
+        // (~256 KB), and SMJ right-group spills.
         //
         // Process overhead accounts for: binary .text/.data, mmap'd shared
         // libraries, stack reservation, heap metadata, and Rust runtime.
@@ -1076,7 +1096,7 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         // is kept as a safety margin for the portal's larger shared-lib set.
         const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
         let usable = self.memory_limit_bytes.saturating_sub(PROCESS_OVERHEAD);
-        let budget = (usable as usize) * 70 / 100;
+        let budget = (usable as usize) * 63 / 100;
         if budget < row_size {
             anyhow::bail!(
                 "SortOperator: memory limit ({} bytes) too small to hold even one row (~{} bytes estimated)",
@@ -1313,7 +1333,10 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
     fn right_row_size(&self) -> usize {
         let mut s = 24usize;
         for col in &self.right_cols {
-            s += match col.data_type { DataType::String => 64, _ => 32 };
+            s += match col.data_type {
+                DataType::String => STRING_CELL_MEM_ESTIMATE,
+                _ => SCALAR_CELL_MEM_ESTIMATE,
+            };
         }
         s
     }
