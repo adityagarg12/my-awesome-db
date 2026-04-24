@@ -61,6 +61,17 @@ fn db_main() -> Result<()> {
     };
     let anon_allocator = AnonBlockAllocator::new(anon_start);
 
+    // Reserve memory for the shared buffer pool (256 blocks) and per-ScanOperator
+    // prefetch buffers (16 blocks each; at most 2 scan operators run concurrently
+    // in a join query).  Operators receive a reduced limit so they don't over-allocate
+    // and exceed the total process memory ceiling.
+    const BUFFER_POOL_BLOCKS: u64 = 256;
+    const PREFETCH_BLOCKS_PER_SCAN: u64 = 16;
+    const MAX_CONCURRENT_SCANS: u64 = 2;
+    let buffer_reserved = (BUFFER_POOL_BLOCKS + PREFETCH_BLOCKS_PER_SCAN * MAX_CONCURRENT_SCANS)
+        .saturating_mul(block_size);
+    let operator_memory_limit = memory_limit_bytes.saturating_sub(buffer_reserved);
+
     // 4. Optimize query tree, then build operator tree
     let optimized = optimize(query.root, &catalog);
     let mut root_op = build_operator(
@@ -68,7 +79,7 @@ fn db_main() -> Result<()> {
         &catalog,
         disk_access,
         block_size,
-        memory_limit_bytes,
+        operator_memory_limit,
         &anon_allocator,
     )?;
 

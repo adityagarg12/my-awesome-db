@@ -86,6 +86,9 @@ pub trait Operator {
     fn next(&mut self) -> Result<Option<Row>>;
 }
 
+// Number of blocks the ScanOperator fetches in a single disk command.
+const PREFETCH_SIZE: u64 = 16;
+
 // ---------------------------------------------------------------------------
 // Anonymous-block allocator (sparse disk scratch space)
 // ---------------------------------------------------------------------------
@@ -93,19 +96,47 @@ pub trait Operator {
 #[derive(Clone)]
 pub struct AnonBlockAllocator {
     next_block: Arc<Mutex<u64>>,
+    /// Freed (start, count) segments available for reuse.
+    free_list: Arc<Mutex<Vec<(u64, u64)>>>,
 }
 
 impl AnonBlockAllocator {
     pub fn new(start: u64) -> Self {
-        Self { next_block: Arc::new(Mutex::new(start)) }
+        Self {
+            next_block: Arc::new(Mutex::new(start)),
+            free_list: Arc::new(Mutex::new(Vec::new())),
+        }
     }
-    /// Atomically allocate `count` consecutive anonymous blocks.
+
+    /// Allocate `count` consecutive anonymous blocks, preferring the free list.
     /// Returns the starting block ID.
     pub fn allocate(&self, count: u64) -> u64 {
+        let mut free = self.free_list.lock().unwrap();
+        for i in 0..free.len() {
+            if free[i].1 == count {
+                let start = free[i].0;
+                free.swap_remove(i);
+                return start;
+            }
+            if free[i].1 > count {
+                let start = free[i].0;
+                free[i].0 += count;
+                free[i].1 -= count;
+                return start;
+            }
+        }
+        drop(free);
         let mut next = self.next_block.lock().unwrap();
         let start = *next;
         *next += count;
         start
+    }
+
+    /// Return `count` blocks starting at `start` to the free list for reuse.
+    pub fn free(&self, start: u64, count: u64) {
+        if count > 0 {
+            self.free_list.lock().unwrap().push((start, count));
+        }
     }
 }
 
@@ -121,7 +152,14 @@ pub struct ScanOperator<R: Read, W: Write> {
     // Populated on first next()
     start_block: u64,
     num_blocks: u64,
-    current_block_offset: u64,
+    /// Offset of the next block to fetch from disk (advances by PREFETCH_SIZE).
+    next_block_to_fetch: u64,
+    /// Raw bytes of the most recently prefetched batch (up to PREFETCH_SIZE blocks).
+    prefetch_buf: Vec<u8>,
+    /// How many blocks are currently in prefetch_buf.
+    prefetch_count: u64,
+    /// Which block within prefetch_buf to decode next (0-based).
+    prefetch_idx: u64,
     current_rows: Vec<Row>,
     current_row_idx: usize,
     initialized: bool,
@@ -140,7 +178,10 @@ impl<R: Read, W: Write> ScanOperator<R, W> {
             block_size,
             start_block: 0,
             num_blocks: 0,
-            current_block_offset: 0,
+            next_block_to_fetch: 0,
+            prefetch_buf: Vec::new(),
+            prefetch_count: 0,
+            prefetch_idx: 0,
             current_rows: Vec::new(),
             current_row_idx: 0,
             initialized: false,
@@ -155,20 +196,37 @@ impl<R: Read, W: Write> ScanOperator<R, W> {
         Ok(())
     }
 
-    /// Load the next block from disk into `current_rows`. Returns false when
-    /// all blocks have been read.
+    /// Decode the next block, prefetching PREFETCH_SIZE blocks at a time via a
+    /// single disk command.  Returns false when the file is exhausted.
     fn load_next_block(&mut self) -> Result<bool> {
-        if self.current_block_offset >= self.num_blocks {
-            return Ok(false);
+        // Refill the prefetch buffer when it is exhausted.
+        if self.prefetch_idx >= self.prefetch_count {
+            if self.next_block_to_fetch >= self.num_blocks {
+                return Ok(false);
+            }
+            let remaining = self.num_blocks - self.next_block_to_fetch;
+            let fetch_count = remaining.min(PREFETCH_SIZE);
+            let start_id = self.start_block + self.next_block_to_fetch;
+            // One disk command reads up to 16 blocks; they are also inserted
+            // into the shared buffer pool cache inside read_blocks().
+            self.prefetch_buf = {
+                let mut disk = self.disk_access.lock().unwrap();
+                disk.read_blocks(start_id, fetch_count)?
+            };
+            self.prefetch_count = fetch_count;
+            self.prefetch_idx = 0;
+            self.next_block_to_fetch += fetch_count;
         }
-        let block_id = self.start_block + self.current_block_offset;
-        let block_data = {
-            let mut disk = self.disk_access.lock().unwrap();
-            disk.read_blocks(block_id, 1)?
+
+        // Decode the next block from the in-hand prefetch buffer.
+        let offset = (self.prefetch_idx * self.block_size) as usize;
+        let rows = {
+            let block_slice = &self.prefetch_buf[offset..offset + self.block_size as usize];
+            decode_block(block_slice, self.block_size, self.schema.columns())?
         };
-        self.current_rows = decode_block(&block_data, self.block_size, self.schema.columns())?;
+        self.current_rows = rows;
         self.current_row_idx = 0;
-        self.current_block_offset += 1;
+        self.prefetch_idx += 1;
         Ok(true)
     }
 }
@@ -971,6 +1029,10 @@ impl<R: Read, W: Write> SortOperator<R, W> {
                 let mut merged = Vec::with_capacity((runs.len() + fan_in - 1) / fan_in);
                 for batch in runs.chunks(fan_in) {
                     merged.push(self.merge_runs_to_disk(batch)?);
+                    // Input runs are fully consumed; return their blocks for reuse.
+                    for &(start, n) in batch {
+                        self.anon_allocator.free(start, n);
+                    }
                 }
                 runs = merged;
             }
@@ -1197,12 +1259,20 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
     /// On overflow, spill ALL accumulated rows (and remaining ones) to disk.
     /// After this call `right_peek` holds the first non-matching right row (or None).
     fn load_right_group(&mut self, first_row: Row) -> Result<()> {
+        // Release the previous group's anonymous disk blocks before overwriting
+        // the tracking fields, so those blocks can be reused by the allocator.
+        if self.right_group_on_disk && self.right_group_num_blocks > 0 {
+            self.anon_allocator.free(self.right_group_start_block, self.right_group_num_blocks);
+        }
+
         let key      = self.extract_right_key(&first_row);
         let max_rows = self.max_right_group_rows();
 
         self.right_group_ram.clear();
         self.right_group_idx      = 0;
         self.right_group_on_disk  = false;
+        self.right_group_start_block = 0;
+        self.right_group_num_blocks  = 0;
         self.right_group_disk_reader = None;
 
         self.right_group_ram.push(first_row);
