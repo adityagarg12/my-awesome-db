@@ -185,6 +185,18 @@ impl AnonBlockAllocator {
             self.free_list.lock().unwrap().push((start, count));
         }
     }
+
+    /// Allocate `count` consecutive blocks from the sequential counter, ignoring
+    /// the free list.  Use this for streaming writes (where total size is unknown
+    /// upfront and blocks are allocated in multiple BATCH_BLOCKS-sized calls).
+    /// Guarantees that consecutive calls return truly consecutive block IDs, so
+    /// RunReader can read them back as a single contiguous range.
+    pub fn allocate_sequential(&self, count: u64) -> u64 {
+        let mut next = self.next_block.lock().unwrap();
+        let start = *next;
+        *next += count;
+        start
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -571,7 +583,7 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
                 in_batch += 1;
                 if in_batch == BATCH_BLOCKS {
                     let n  = in_batch as u64;
-                    let id = self.anon_allocator.allocate(n);
+                    let id = self.anon_allocator.allocate_sequential(n);
                     if !got_first { first_block = id; got_first = true; }
                     self.disk_access.lock().unwrap().write_blocks(id, n, &batch)?;
                     total_blocks += n; in_batch = 0;
@@ -597,7 +609,7 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
         }
         if in_batch > 0 {
             let n  = in_batch as u64;
-            let id = self.anon_allocator.allocate(n);
+            let id = self.anon_allocator.allocate_sequential(n);
             if !got_first { first_block = id; }
             self.disk_access.lock().unwrap().write_blocks(id, n, &batch[..in_batch * bs])?;
             total_blocks += n;
@@ -996,27 +1008,30 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         // Rows are streamed from the heap so we cannot pre-count; we batch-allocate
         // instead.  Allocations within a single merge call are sequential because
         // no other code touches the allocator concurrently (single-threaded executor).
+        // Pre-allocate a single contiguous range.  Merge output encodes the same
+        // rows with the same block size, so total output blocks ≤ total input blocks.
+        // We allocate the upper bound and free any unused tail afterward.
+        let max_blocks: u64 = run_specs.iter().map(|&(_, n)| n).sum();
+        if max_blocks == 0 {
+            return Ok((0, 0));
+        }
+        let start_block = self.anon_allocator.allocate(max_blocks);
+
         let batch_bytes = BATCH_BLOCKS * bs;
         let mut batch    = vec![0u8; batch_bytes];
         let mut in_batch = 0usize;
-        let mut total_blks = 0u64;
-        let mut first_blk  = 0u64;
-        let mut got_first  = false;
+        let mut blks_out = 0u64;
 
         let mut block    = vec![0u8; bs];
         let mut blk_off  = 0usize;
         let mut rows_blk = 0u16;
 
-        let mut flush_batch = |batch: &[u8], in_batch: usize, total_blks: &mut u64,
-                               first_blk: &mut u64, got_first: &mut bool| -> Result<()> {
+        // Write a full BATCH_BLOCKS batch into the pre-allocated contiguous range.
+        let flush_batch = |batch: &[u8], in_batch: usize, blks_out: u64,
+                           disk: &Arc<Mutex<DiskAccessLayer<R, W>>>| -> Result<()> {
             if in_batch == 0 { return Ok(()); }
-            let n  = in_batch as u64;
-            let id = self.anon_allocator.allocate(n);
-            if !*got_first { *first_blk = id; *got_first = true; }
-            self.disk_access.lock().unwrap()
-                .write_blocks(id, n, &batch[..in_batch * bs])?;
-            *total_blks += n;
-            Ok(())
+            disk.lock().unwrap()
+                .write_blocks(start_block + blks_out, in_batch as u64, &batch[..in_batch * bs])
         };
 
         while let Some(entry) = heap.pop() {
@@ -1041,7 +1056,8 @@ impl<R: Read, W: Write> SortOperator<R, W> {
                 block.fill(0); blk_off = 0; rows_blk = 0;
                 in_batch += 1;
                 if in_batch == BATCH_BLOCKS {
-                    flush_batch(&batch, in_batch, &mut total_blks, &mut first_blk, &mut got_first)?;
+                    flush_batch(&batch, in_batch, blks_out, &self.disk_access)?;
+                    blks_out += in_batch as u64;
                     in_batch = 0;
                 }
             }
@@ -1057,9 +1073,17 @@ impl<R: Read, W: Write> SortOperator<R, W> {
             batch[in_batch * bs..(in_batch + 1) * bs].copy_from_slice(&block);
             in_batch += 1;
         }
-        flush_batch(&batch, in_batch, &mut total_blks, &mut first_blk, &mut got_first)?;
+        if in_batch > 0 {
+            flush_batch(&batch, in_batch, blks_out, &self.disk_access)?;
+            blks_out += in_batch as u64;
+        }
 
-        Ok((first_blk, total_blks))
+        // Return unused pre-allocated blocks to the free list.
+        if blks_out < max_blocks {
+            self.anon_allocator.free(start_block + blks_out, max_blocks - blks_out);
+        }
+
+        Ok((start_block, blks_out))
     }
 
     /// Prime the final streaming merge heap from `self.run_readers`.
@@ -1446,7 +1470,7 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
                     in_batch += 1;
                     if in_batch == BATCH_BLOCKS {
                         let n  = in_batch as u64;
-                        let id = self.anon_allocator.allocate(n);
+                        let id = self.anon_allocator.allocate_sequential(n);
                         if !got_first { first_blk = id; got_first = true; }
                         self.disk_access.lock().unwrap().write_blocks(id, n, &batch)?;
                         total_blks += n; in_batch = 0;
@@ -1487,7 +1511,7 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
         }
         if in_batch > 0 {
             let n  = in_batch as u64;
-            let id = self.anon_allocator.allocate(n);
+            let id = self.anon_allocator.allocate_sequential(n);
             if !got_first { first_blk = id; }
             self.disk_access.lock().unwrap().write_blocks(id, n, &batch[..in_batch * bs])?;
             total_blks += n;
