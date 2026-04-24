@@ -6,3 +6,4 @@
 **/*.bin
 **/*.sql
 *.gz
+CLAUDE.md

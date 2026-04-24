@@ -89,6 +89,53 @@ pub trait Operator {
 // Number of blocks the ScanOperator fetches in a single disk command.
 const PREFETCH_SIZE: u64 = 16;
 
+// Blocks written per write_blocks IPC call in spill/merge paths.
+// 256 blocks × 4 KB = 1 MB write buffer — reduces IPC round trips while
+// keeping peak extra allocation small and independent of chunk/table size.
+const BATCH_BLOCKS: usize = 256;
+
+// Blocks fetched per read_blocks IPC call inside RunReader.
+// Smaller than PREFETCH_SIZE (16) so that merge_fan_in can stay large:
+// each RunReader holds at most RUN_PREFETCH_SIZE decoded blocks in RAM.
+// Worst-case decoded memory per reader = RUN_PREFETCH_SIZE × block_size × 8
+// (factor 8 = Int32 encoded 4 B → Data enum 32 B).  With 4 blocks that's
+// 128 KB/reader, giving fan_in ≈ 240 at 64 MB — well above the number of
+// runs any realistic dataset produces at this memory limit.
+const RUN_PREFETCH_SIZE: u64 = 4;
+
+/// Encoded byte length of one row without allocating any buffer.
+/// Must stay in sync with encode_row / encode_value in row.rs.
+fn row_encoded_len(row: &Row, schema: &[ColumnCatalog]) -> usize {
+    row.values().iter().zip(schema.iter()).map(|(v, col)| {
+        match col.data_type {
+            DataType::Int32  | DataType::Float32 => 4,
+            DataType::Int64  | DataType::Float64 => 8,
+            DataType::String => match v {
+                Data::String(s) => s.len() + 1, // payload + null terminator
+                _               => 1,            // type mismatch; encode_row will error
+            },
+        }
+    }).sum()
+}
+
+/// Count the number of disk blocks needed to store `rows` without allocating
+/// an encoded buffer. Returns Err if any single row exceeds one block's capacity.
+fn count_run_blocks(rows: &[Row], schema: &[ColumnCatalog], block_size: usize) -> Result<u64> {
+    let usable = block_size - 2; // 2-byte row-count footer per block
+    let mut off = 0usize;
+    let mut cnt = 0u64;
+    for row in rows {
+        let len = row_encoded_len(row, schema);
+        if len > usable {
+            anyhow::bail!("row ({} B) exceeds usable block space ({} B)", len, usable);
+        }
+        if off + len > usable { cnt += 1; off = 0; }
+        off += len;
+    }
+    if off > 0 { cnt += 1; }
+    Ok(cnt)
+}
+
 // ---------------------------------------------------------------------------
 // Anonymous-block allocator (sparse disk scratch space)
 // ---------------------------------------------------------------------------
@@ -475,29 +522,36 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
     /// 256 MB limit → 240 MB available (94 %)
     /// 
     fn left_chunk_capacity(&self) -> usize {
-        // TO BE CHECK , we can adjust the PROCESS_OVERHEAD estimate if needed based on actual measurements, which came around 14mb at startup in debug mode and 12mb in release mode. We want to be conservative to avoid OOM, but not too much to underutilize memory.
-        const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024; // 32 MB
+        const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
+        // Reserve one decoded right block (read_block_with_prefetch) + small extras.
         let right_buf = self.block_size * 4;
-        let available = self.memory_limit_bytes
+        let usable = self.memory_limit_bytes
             .saturating_sub(PROCESS_OVERHEAD)
             .saturating_sub(right_buf);
-        (available as usize / self.left_row_size()).max(64)
+        // 70% headroom: actual process overhead is ~40 MB; 32 MB + 30% slack covers it.
+        let budget = (usable as usize) * 70 / 100;
+        (budget / self.left_row_size()).max(64)
     }
 
     // ------------------------------------------------------------------
-    // Phase 1: spill right to anonymous disk, one block at a time
+    // Phase 1: spill right to anonymous disk in BATCH_BLOCKS batches
     // ------------------------------------------------------------------
     fn spill_right(&mut self) -> Result<()> {
         let mut right_child = self.right.take().unwrap();
-        let usable = self.block_size as usize - 2;
+        let bs     = self.block_size as usize;
+        let usable = bs - 2;
 
-        let mut block_buf      = vec![0u8; self.block_size as usize];
-        let mut buf_offset     = 0usize;
-        let mut rows_in_block  = 0u16;
-        let mut total_blocks   = 0u64;
-        let mut first_block    = 0u64;
-        let mut got_first      = false;
-        let mut has_any_row    = false;
+        let batch_bytes = BATCH_BLOCKS * bs;
+        let mut batch        = vec![0u8; batch_bytes];
+        let mut in_batch     = 0usize;
+        let mut total_blocks = 0u64;
+        let mut first_block  = 0u64;
+        let mut got_first    = false;
+        let mut has_any_row  = false;
+
+        let mut block        = vec![0u8; bs];
+        let mut blk_off      = 0usize;
+        let mut rows_blk     = 0u16;
 
         while let Some(row) = right_child.next()? {
             has_any_row = true;
@@ -509,20 +563,24 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
                 );
             }
 
-            if buf_offset + encoded.len() > usable {
-                // Flush current block to disk
-                let footer = block_buf.len() - 2;
-                block_buf[footer..].copy_from_slice(&rows_in_block.to_le_bytes());
-                let id = self.anon_allocator.allocate(1);
-                if !got_first { first_block = id; got_first = true; }
-                self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
-                total_blocks += 1;
-                block_buf.fill(0); buf_offset = 0; rows_in_block = 0;
+            if blk_off + encoded.len() > usable {
+                let footer = block.len() - 2;
+                block[footer..].copy_from_slice(&rows_blk.to_le_bytes());
+                batch[in_batch * bs..(in_batch + 1) * bs].copy_from_slice(&block);
+                block.fill(0); blk_off = 0; rows_blk = 0;
+                in_batch += 1;
+                if in_batch == BATCH_BLOCKS {
+                    let n  = in_batch as u64;
+                    let id = self.anon_allocator.allocate(n);
+                    if !got_first { first_block = id; got_first = true; }
+                    self.disk_access.lock().unwrap().write_blocks(id, n, &batch)?;
+                    total_blocks += n; in_batch = 0;
+                }
             }
 
-            block_buf[buf_offset..buf_offset + encoded.len()].copy_from_slice(&encoded);
-            buf_offset    += encoded.len();
-            rows_in_block += 1;
+            block[blk_off..blk_off + encoded.len()].copy_from_slice(&encoded);
+            blk_off  += encoded.len();
+            rows_blk += 1;
         }
 
         if !has_any_row {
@@ -530,13 +588,20 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
             return Ok(());
         }
 
-        // Flush the final (possibly partial) block
-        let footer = block_buf.len() - 2;
-        block_buf[footer..].copy_from_slice(&rows_in_block.to_le_bytes());
-        let id = self.anon_allocator.allocate(1);
-        if !got_first { first_block = id; }
-        self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
-        total_blocks += 1;
+        // Seal and flush the final partial block + remaining batch.
+        if rows_blk > 0 {
+            let footer = block.len() - 2;
+            block[footer..].copy_from_slice(&rows_blk.to_le_bytes());
+            batch[in_batch * bs..(in_batch + 1) * bs].copy_from_slice(&block);
+            in_batch += 1;
+        }
+        if in_batch > 0 {
+            let n  = in_batch as u64;
+            let id = self.anon_allocator.allocate(n);
+            if !got_first { first_block = id; }
+            self.disk_access.lock().unwrap().write_blocks(id, n, &batch[..in_batch * bs])?;
+            total_blocks += n;
+        }
 
         self.right_start_block = first_block;
         self.right_num_blocks  = total_blocks;
@@ -563,7 +628,9 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
     /// Load right block at `offset` into right_block_rows; reset right_row_idx.
     fn load_right_block(&mut self, offset: u64) -> Result<()> {
         let id   = self.right_start_block + offset;
-        let data = { self.disk_access.lock().unwrap().read_blocks(id, 1)? };
+        let remaining = self.right_num_blocks.saturating_sub(offset);
+        let prefetch  = remaining.min(PREFETCH_SIZE);
+        let data = { self.disk_access.lock().unwrap().read_block_with_prefetch(id, prefetch)? };
         self.right_block_rows = decode_block(&data, self.block_size, &self.right_cols)?;
         self.right_row_idx    = 0;
         Ok(())
@@ -678,13 +745,22 @@ impl<R: Read, W: Write> RunReader<R, W> {
                 return Ok(None);
             }
             let block_id = self.start_block + self.blocks_read;
+            let remaining = self.num_blocks - self.blocks_read;
+            let fetch = remaining.min(RUN_PREFETCH_SIZE);
             let data = {
                 let mut disk = self.disk_access.lock().unwrap();
-                disk.read_blocks(block_id, 1)?
+                disk.read_blocks(block_id, fetch)?
             };
-            self.current_rows = decode_block(&data, self.block_size, &self.columns)?;
+            let bs = self.block_size as usize;
+            let mut all_rows = Vec::new();
+            for i in 0..fetch as usize {
+                let slice = &data[i * bs..(i + 1) * bs];
+                let mut block_rows = decode_block(slice, self.block_size, &self.columns)?;
+                all_rows.append(&mut block_rows);
+            }
+            self.current_rows = all_rows;
             self.row_idx = 0;
-            self.blocks_read += 1;
+            self.blocks_read += fetch;
         }
     }
 }
@@ -785,51 +861,72 @@ impl<R: Read, W: Write> SortOperator<R, W> {
 
     /// Write a sorted chunk to anonymous disk.
     ///
-    /// Encodes rows block-by-block into a Vec<u8> accumulator, then allocates
-    /// all blocks at once and issues a single write_blocks call. This avoids
-    /// the per-block IPC + seek overhead that occurs when writing one block at
-    /// a time to the disk simulator (each call triggers a full seek simulation).
+    /// Two-pass design:
+    ///   Pass 1 – count exact block count via `count_run_blocks` (no allocation).
+    ///   Pass 2 – encode rows and write in BATCH_BLOCKS-sized batches.
     ///
-    /// Peak extra allocation: encoded Vec<u8>, which is ~5-8x smaller than the
-    /// Vec<Row> chunk because encoded bytes carry only raw values, not Data
-    /// enum overhead. Net peak ≈ chunk_size × 1.15 rather than × 2.
+    /// A single `allocate(num_blocks)` call gives one contiguous disk range so
+    /// RunReader can replay it with sequential IDs.  Peak extra allocation is
+    /// BATCH_BLOCKS × block_size (1 MB), independent of chunk size or schema —
+    /// no OOM regardless of memory limit, dataset, or string widths.
     fn write_run(&self, rows: &[Row]) -> Result<(u64, u64)> {
         let cols   = self.schema.columns();
-        let usable = self.block_size as usize - 2;
+        let bs     = self.block_size as usize;
+        let usable = bs - 2;
 
-        let mut encoded     = Vec::new();
-        let mut block_buf   = vec![0u8; self.block_size as usize];
-        let mut buf_offset  = 0usize;
-        let mut rows_in_blk = 0u16;
+        // Pass 1: count blocks without allocating any encoded buffer.
+        let num_blocks = count_run_blocks(rows, cols, bs)?;
+        if num_blocks == 0 { return Ok((0, 0)); }
+
+        // Single allocate → contiguous range, immune to free-list fragmentation.
+        let start = self.anon_allocator.allocate(num_blocks);
+
+        // Pass 2: encode + write through a fixed 1 MB batch buffer.
+        let batch_bytes = BATCH_BLOCKS * bs;
+        let mut batch    = vec![0u8; batch_bytes];
+        let mut in_batch = 0usize; // full blocks currently in `batch`
+        let mut blks_out = 0u64;
+
+        let mut block    = vec![0u8; bs];
+        let mut blk_off  = 0usize;
+        let mut rows_blk = 0u16;
 
         for row in rows {
             let enc = encode_row(row, cols)?;
-            if enc.len() > usable {
-                anyhow::bail!(
-                    "SortOperator: row ({} B) exceeds usable block space ({} B)",
-                    enc.len(), usable
-                );
+            if blk_off + enc.len() > usable {
+                // Seal current block into batch.
+                let footer = block.len() - 2;
+                block[footer..].copy_from_slice(&rows_blk.to_le_bytes());
+                batch[in_batch * bs..(in_batch + 1) * bs].copy_from_slice(&block);
+                block.fill(0); blk_off = 0; rows_blk = 0;
+                in_batch += 1;
+                if in_batch == BATCH_BLOCKS {
+                    let n = in_batch as u64;
+                    self.disk_access.lock().unwrap()
+                        .write_blocks(start + blks_out, n, &batch)?;
+                    blks_out += n; in_batch = 0;
+                }
             }
-            if buf_offset + enc.len() > usable {
-                let footer = block_buf.len() - 2;
-                block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
-                encoded.extend_from_slice(&block_buf);
-                block_buf.fill(0); buf_offset = 0; rows_in_blk = 0;
-            }
-            block_buf[buf_offset..buf_offset + enc.len()].copy_from_slice(&enc);
-            buf_offset  += enc.len();
-            rows_in_blk += 1;
+            block[blk_off..blk_off + enc.len()].copy_from_slice(&enc);
+            blk_off  += enc.len();
+            rows_blk += 1;
         }
 
-        if rows_in_blk > 0 {
-            let footer = block_buf.len() - 2;
-            block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
-            encoded.extend_from_slice(&block_buf);
+        // Seal and flush the final (partial) block + remaining batch.
+        if rows_blk > 0 {
+            let footer = block.len() - 2;
+            block[footer..].copy_from_slice(&rows_blk.to_le_bytes());
+            batch[in_batch * bs..(in_batch + 1) * bs].copy_from_slice(&block);
+            in_batch += 1;
+        }
+        if in_batch > 0 {
+            let n = in_batch as u64;
+            self.disk_access.lock().unwrap()
+                .write_blocks(start + blks_out, n, &batch[..in_batch * bs])?;
+            blks_out += n;
         }
 
-        let num_blocks = (encoded.len() / self.block_size as usize) as u64;
-        let start = self.anon_allocator.allocate(num_blocks);
-        self.disk_access.lock().unwrap().write_blocks(start, num_blocks, &encoded)?;
+        debug_assert_eq!(blks_out, num_blocks, "write_run: block count mismatch");
         Ok((start, num_blocks))
     }
 
@@ -854,14 +951,19 @@ impl<R: Read, W: Write> SortOperator<R, W> {
     ///   fan_in   =  (available − block_size) / per_run
     /// 
     fn merge_fan_in(&self) -> usize {
-        // to be check
         const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
+        // Reserve BATCH_BLOCKS (1 MB) for the write buffer in merge_runs_to_disk.
+        let write_buf = BATCH_BLOCKS as u64 * self.block_size;
         let available = self.memory_limit_bytes
             .saturating_sub(PROCESS_OVERHEAD)
-            .saturating_sub(self.block_size) as usize;
-        //TO BE CHECK
-        let key_size  = 24 + self.sort_specs.len() * 40; // Vec header (24) + (Data,bool) per col (40)
-        let per_run   = self.block_size as usize + key_size;
+            .saturating_sub(write_buf) as usize;
+
+        // Per RunReader: holds up to RUN_PREFETCH_SIZE decoded blocks.
+        // Decoded rows can be up to 8× larger than encoded (worst case: pure
+        // Int32 — 4 bytes encoded → 32-byte Data enum).  key_size covers the
+        // HeapEntry key cloned for each popped row.
+        let key_size = 24 + self.sort_specs.len() * 40;
+        let per_run  = RUN_PREFETCH_SIZE as usize * self.block_size as usize * 8 + key_size;
         (available / per_run.max(1)).max(2)
     }
 
@@ -887,13 +989,35 @@ impl<R: Read, W: Write> SortOperator<R, W> {
             }
         }
 
-        let usable          = self.block_size as usize - 2;
-        let mut block_buf   = vec![0u8; self.block_size as usize];
-        let mut buf_offset  = 0usize;
-        let mut rows_in_blk = 0u16;
-        let mut total_blks  = 0u64;
-        let mut first_blk   = 0u64;
-        let mut got_first   = false;
+        let bs     = self.block_size as usize;
+        let usable = bs - 2;
+
+        // BATCH_BLOCKS blocks accumulated before a single write_blocks call.
+        // Rows are streamed from the heap so we cannot pre-count; we batch-allocate
+        // instead.  Allocations within a single merge call are sequential because
+        // no other code touches the allocator concurrently (single-threaded executor).
+        let batch_bytes = BATCH_BLOCKS * bs;
+        let mut batch    = vec![0u8; batch_bytes];
+        let mut in_batch = 0usize;
+        let mut total_blks = 0u64;
+        let mut first_blk  = 0u64;
+        let mut got_first  = false;
+
+        let mut block    = vec![0u8; bs];
+        let mut blk_off  = 0usize;
+        let mut rows_blk = 0u16;
+
+        let mut flush_batch = |batch: &[u8], in_batch: usize, total_blks: &mut u64,
+                               first_blk: &mut u64, got_first: &mut bool| -> Result<()> {
+            if in_batch == 0 { return Ok(()); }
+            let n  = in_batch as u64;
+            let id = self.anon_allocator.allocate(n);
+            if !*got_first { *first_blk = id; *got_first = true; }
+            self.disk_access.lock().unwrap()
+                .write_blocks(id, n, &batch[..in_batch * bs])?;
+            *total_blks += n;
+            Ok(())
+        };
 
         while let Some(entry) = heap.pop() {
             let run_idx = entry.run_idx;
@@ -910,31 +1034,30 @@ impl<R: Read, W: Write> SortOperator<R, W> {
                 );
             }
 
-            if buf_offset + encoded.len() > usable {
-                // Flush full block
-                let footer = block_buf.len() - 2;
-                block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
-                let id = self.anon_allocator.allocate(1);
-                if !got_first { first_blk = id; got_first = true; }
-                self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
-                total_blks += 1;
-                block_buf.fill(0); buf_offset = 0; rows_in_blk = 0;
+            if blk_off + encoded.len() > usable {
+                let footer = block.len() - 2;
+                block[footer..].copy_from_slice(&rows_blk.to_le_bytes());
+                batch[in_batch * bs..(in_batch + 1) * bs].copy_from_slice(&block);
+                block.fill(0); blk_off = 0; rows_blk = 0;
+                in_batch += 1;
+                if in_batch == BATCH_BLOCKS {
+                    flush_batch(&batch, in_batch, &mut total_blks, &mut first_blk, &mut got_first)?;
+                    in_batch = 0;
+                }
             }
 
-            block_buf[buf_offset..buf_offset + encoded.len()].copy_from_slice(&encoded);
-            buf_offset  += encoded.len();
-            rows_in_blk += 1;
+            block[blk_off..blk_off + encoded.len()].copy_from_slice(&encoded);
+            blk_off  += encoded.len();
+            rows_blk += 1;
         }
 
-        // Flush final (possibly partial) block
-        if rows_in_blk > 0 {
-            let footer = block_buf.len() - 2;
-            block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
-            let id = self.anon_allocator.allocate(1);
-            if !got_first { first_blk = id; }
-            self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
-            total_blks += 1;
+        if rows_blk > 0 {
+            let footer = block.len() - 2;
+            block[footer..].copy_from_slice(&rows_blk.to_le_bytes());
+            batch[in_batch * bs..(in_batch + 1) * bs].copy_from_slice(&block);
+            in_batch += 1;
         }
+        flush_batch(&batch, in_batch, &mut total_blks, &mut first_blk, &mut got_first)?;
 
         Ok((first_blk, total_blks))
     }
@@ -1220,8 +1343,14 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
     /// Maximum right-group rows we can hold in RAM without exceeding budget.
     fn max_right_group_rows(&self) -> usize {
         const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
-        let available = self.memory_limit_bytes.saturating_sub(PROCESS_OVERHEAD) as usize;
-        (available / self.right_row_size()).max(1)
+        // Reserve BATCH_BLOCKS write buffer allocated simultaneously with ram_rows during spill.
+        let write_buf = BATCH_BLOCKS as u64 * self.block_size;
+        let usable = self.memory_limit_bytes
+            .saturating_sub(PROCESS_OVERHEAD)
+            .saturating_sub(write_buf) as usize;
+        // 70% headroom: actual overhead exceeds 32 MB; slack prevents OOM under any dataset.
+        let budget = usable * 70 / 100;
+        (budget / self.right_row_size()).max(1)
     }
 
     fn extract_left_key(&self, row: &Row) -> Vec<Data> {
@@ -1288,36 +1417,49 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
             }
         }
 
-        // Phase 2: RAM limit hit — spill everything to disk
+        // Phase 2: RAM limit hit — spill everything to disk in BATCH_BLOCKS batches.
         self.right_group_on_disk = true;
         let ram_rows = std::mem::take(&mut self.right_group_ram);
 
-        let usable          = self.block_size as usize - 2;
-        let mut block_buf   = vec![0u8; self.block_size as usize];
-        let mut buf_offset  = 0usize;
-        let mut rows_in_blk = 0u16;
-        let mut total_blks  = 0u64;
-        let mut first_blk   = 0u64;
-        let mut got_first   = false;
+        let bs     = self.block_size as usize;
+        let usable = bs - 2;
 
-        // Inline flush helper via a labelled block (avoids borrow conflicts)
-        macro_rules! flush_block {
-            () => {{
-                let footer = block_buf.len() - 2;
-                block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
-                let id = self.anon_allocator.allocate(1);
-                if !got_first { first_blk = id; got_first = true; }
-                self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
-                total_blks += 1;
-                block_buf.fill(0); buf_offset = 0; rows_in_blk = 0;
-            }};
+        let batch_bytes = BATCH_BLOCKS * bs;
+        let mut batch    = vec![0u8; batch_bytes];
+        let mut in_batch = 0usize;
+        let mut total_blks = 0u64;
+        let mut first_blk  = 0u64;
+        let mut got_first  = false;
+
+        let mut block    = vec![0u8; bs];
+        let mut blk_off  = 0usize;
+        let mut rows_blk = 0u16;
+
+        // Seal current block into batch; flush batch to disk when full.
+        macro_rules! maybe_seal_block {
+            ($enc:expr) => {
+                if blk_off + $enc.len() > usable {
+                    let footer = block.len() - 2;
+                    block[footer..].copy_from_slice(&rows_blk.to_le_bytes());
+                    batch[in_batch * bs..(in_batch + 1) * bs].copy_from_slice(&block);
+                    block.fill(0); blk_off = 0; rows_blk = 0;
+                    in_batch += 1;
+                    if in_batch == BATCH_BLOCKS {
+                        let n  = in_batch as u64;
+                        let id = self.anon_allocator.allocate(n);
+                        if !got_first { first_blk = id; got_first = true; }
+                        self.disk_access.lock().unwrap().write_blocks(id, n, &batch)?;
+                        total_blks += n; in_batch = 0;
+                    }
+                }
+            };
         }
 
         for row in ram_rows {
             let enc = encode_row(&row, &self.right_cols)?;
-            if buf_offset + enc.len() > usable { flush_block!(); }
-            block_buf[buf_offset..buf_offset + enc.len()].copy_from_slice(&enc);
-            buf_offset += enc.len(); rows_in_blk += 1;
+            maybe_seal_block!(enc);
+            block[blk_off..blk_off + enc.len()].copy_from_slice(&enc);
+            blk_off += enc.len(); rows_blk += 1;
         }
 
         loop {
@@ -1329,14 +1471,27 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
                         self.right_peek = Some(row); break;
                     }
                     let enc = encode_row(&row, &self.right_cols)?;
-                    if buf_offset + enc.len() > usable { flush_block!(); }
-                    block_buf[buf_offset..buf_offset + enc.len()].copy_from_slice(&enc);
-                    buf_offset += enc.len(); rows_in_blk += 1;
+                    maybe_seal_block!(enc);
+                    block[blk_off..blk_off + enc.len()].copy_from_slice(&enc);
+                    blk_off += enc.len(); rows_blk += 1;
                 }
             }
         }
 
-        if rows_in_blk > 0 { flush_block!(); }
+        // Seal final partial block and flush remaining batch.
+        if rows_blk > 0 {
+            let footer = block.len() - 2;
+            block[footer..].copy_from_slice(&rows_blk.to_le_bytes());
+            batch[in_batch * bs..(in_batch + 1) * bs].copy_from_slice(&block);
+            in_batch += 1;
+        }
+        if in_batch > 0 {
+            let n  = in_batch as u64;
+            let id = self.anon_allocator.allocate(n);
+            if !got_first { first_blk = id; }
+            self.disk_access.lock().unwrap().write_blocks(id, n, &batch[..in_batch * bs])?;
+            total_blks += n;
+        }
 
         self.right_group_start_block = first_blk;
         self.right_group_num_blocks  = total_blks;
