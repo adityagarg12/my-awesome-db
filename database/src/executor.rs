@@ -954,7 +954,9 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         // Query 9 on larger datasets can produce many runs; opening too many
         // readers in one pass is a common OOM trigger.
         const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
-        const MAX_MERGE_FAN_IN: usize = 32;
+        // With batch=4 and per_run≈25 KB, 128 readers use only ~3.2 MB —
+        // well within the 32 MB available — and often eliminates one merge pass.
+        const MAX_MERGE_FAN_IN: usize = 128;
         let available = self.memory_limit_bytes
             .saturating_sub(PROCESS_OVERHEAD)
             .saturating_sub(self.block_size) as usize;
@@ -1084,11 +1086,12 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         // memory = one block_size buffer ≈ 4 KB), so we no longer need to
         // reserve half the budget for a monolithic encoded Vec.
         //
-        // Budget = 63 % of memory available after subtracting process overhead.
-        // The merge phase uses at most
-        //   MAX_MERGE_FAN_IN × (RUN_READER_BATCH_BLOCKS+2) × block_size ≈ 1.5 MB
-        // so 37 % headroom easily covers that, the write-run batch buffer
-        // (~256 KB), and SMJ right-group spills.
+        // Budget = 70 % of memory available after subtracting process overhead.
+        // Sort and merge phases do NOT overlap (chunk is drop()-ped before any
+        // merge begins), so each phase is budgeted independently:
+        //   sort peak : 70 % × 32 MB + 256 KB write-batch ≈ 22.7 MB
+        //   merge peak: MAX_MERGE_FAN_IN × per_run ≈ 128 × 25 KB = 3.2 MB
+        // Both fit comfortably in the 32 MB available.
         //
         // Process overhead accounts for: binary .text/.data, mmap'd shared
         // libraries, stack reservation, heap metadata, and Rust runtime.
@@ -1096,7 +1099,7 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         // is kept as a safety margin for the portal's larger shared-lib set.
         const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
         let usable = self.memory_limit_bytes.saturating_sub(PROCESS_OVERHEAD);
-        let budget = (usable as usize) * 63 / 100;
+        let budget = (usable as usize) * 70 / 100;
         if budget < row_size {
             anyhow::bail!(
                 "SortOperator: memory limit ({} bytes) too small to hold even one row (~{} bytes estimated)",
