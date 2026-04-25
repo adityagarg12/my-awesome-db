@@ -466,6 +466,7 @@ pub struct CrossOperator<R: Read, W: Write> {
 
     // B-NLJ iteration state
     left_chunk: Vec<Row>,           // buffered left rows for current outer pass
+    left_next_row: Option<Row>,     // row that didn't fit current chunk budget
     left_exhausted: bool,
     right_block_offset: u64,        // which right block (0-based) we are scanning
     right_block_rows: Vec<Row>,     // decoded rows from current right block
@@ -493,6 +494,7 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
             right_num_blocks: 0,
             right_extents: Vec::new(),
             left_chunk: Vec::new(), left_exhausted: false,
+            left_next_row: None,
             right_block_offset: 0,
             right_block_rows: Vec::new(),
             right_row_idx: 0, left_chunk_idx: 0,
@@ -641,11 +643,19 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
         self.left_chunk.clear();
         let budget = self.left_chunk_budget_bytes();
         let mut used = 0usize;
+
+        if let Some(row) = self.left_next_row.take() {
+            let sz = row.exact_mem_size();
+            used = used.saturating_add(sz);
+            self.left_chunk.push(row);
+        }
+
         loop {
             match self.left.next()? {
                 Some(row) => {
                     let sz = row.exact_mem_size();
                     if !self.left_chunk.is_empty() && used.saturating_add(sz) > budget {
+                        self.left_next_row = Some(row);
                         break;
                     }
                     used = used.saturating_add(sz);
@@ -952,7 +962,7 @@ pub struct SortOperator<R: Read, W: Write> {
     in_memory_rows: Vec<Row>,
     in_memory_idx: usize,
     // External-sort path
-    run_readers: Vec<RunReader<R, W>>,
+    run_readers: Vec<SegmentedRunReader<R, W>>,
     merge_heap: BinaryHeap<HeapEntry>,
 }
 
@@ -1114,12 +1124,12 @@ impl<R: Read, W: Write> SortOperator<R, W> {
     ///
     /// Streams row-by-row via the k-way heap — at most one block per input
     /// run is decoded at any time, plus one output block buffer.
-    fn merge_runs_to_disk(&self, run_specs: &[(u64, u64)]) -> Result<(u64, u64)> {
+    fn merge_runs_to_disk(&self, run_specs: &[Vec<(u64, u64)>]) -> Result<Vec<(u64, u64)>> {
         let cols = self.schema.columns().to_vec();
 
-        let mut readers: Vec<RunReader<R, W>> = run_specs.iter()
-            .map(|&(start, n)| RunReader::new(
-                self.disk_access.clone(), cols.clone(), self.block_size, start, n,
+        let mut readers: Vec<SegmentedRunReader<R, W>> = run_specs.iter()
+            .map(|extents| SegmentedRunReader::new(
+                self.disk_access.clone(), cols.clone(), self.block_size, extents.clone(),
             ))
             .collect();
 
@@ -1134,35 +1144,14 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         let bs     = self.block_size as usize;
         let usable = bs - 2;
 
-        // BATCH_BLOCKS blocks accumulated before a single write_blocks call.
-        // Rows are streamed from the heap so we cannot pre-count; we batch-allocate
-        // instead.  Allocations within a single merge call are sequential because
-        // no other code touches the allocator concurrently (single-threaded executor).
-        // Pre-allocate a single contiguous range.  Merge output encodes the same
-        // rows with the same block size, so total output blocks ≤ total input blocks.
-        // We allocate the upper bound and free any unused tail afterward.
-        let max_blocks: u64 = run_specs.iter().map(|&(_, n)| n).sum();
-        if max_blocks == 0 {
-            return Ok((0, 0));
-        }
-        let start_block = self.anon_allocator.allocate(max_blocks);
-
         let batch_bytes = BATCH_BLOCKS * bs;
         let mut batch    = vec![0u8; batch_bytes];
         let mut in_batch = 0usize;
-        let mut blks_out = 0u64;
+        let mut out_extents: Vec<(u64, u64)> = Vec::new();
 
         let mut block    = vec![0u8; bs];
         let mut blk_off  = 0usize;
         let mut rows_blk = 0u16;
-
-        // Write a full BATCH_BLOCKS batch into the pre-allocated contiguous range.
-        let flush_batch = |batch: &[u8], in_batch: usize, blks_out: u64,
-                           disk: &Arc<Mutex<DiskAccessLayer<R, W>>>| -> Result<()> {
-            if in_batch == 0 { return Ok(()); }
-            disk.lock().unwrap()
-                .write_blocks(start_block + blks_out, in_batch as u64, &batch[..in_batch * bs])
-        };
 
         while let Some(entry) = heap.pop() {
             let run_idx = entry.run_idx;
@@ -1186,8 +1175,11 @@ impl<R: Read, W: Write> SortOperator<R, W> {
                 block.fill(0); blk_off = 0; rows_blk = 0;
                 in_batch += 1;
                 if in_batch == BATCH_BLOCKS {
-                    flush_batch(&batch, in_batch, blks_out, &self.disk_access)?;
-                    blks_out += in_batch as u64;
+                    let n = in_batch as u64;
+                    let start = self.anon_allocator.allocate(n);
+                    push_extent(&mut out_extents, start, n);
+                    self.disk_access.lock().unwrap()
+                        .write_blocks(start, n, &batch[..in_batch * bs])?;
                     in_batch = 0;
                 }
             }
@@ -1204,16 +1196,14 @@ impl<R: Read, W: Write> SortOperator<R, W> {
             in_batch += 1;
         }
         if in_batch > 0 {
-            flush_batch(&batch, in_batch, blks_out, &self.disk_access)?;
-            blks_out += in_batch as u64;
+            let n = in_batch as u64;
+            let start = self.anon_allocator.allocate(n);
+            push_extent(&mut out_extents, start, n);
+            self.disk_access.lock().unwrap()
+                .write_blocks(start, n, &batch[..in_batch * bs])?;
         }
 
-        // Return unused pre-allocated blocks to the free list.
-        if blks_out < max_blocks {
-            self.anon_allocator.free(start_block + blks_out, max_blocks - blks_out);
-        }
-
-        Ok((start_block, blks_out))
+        Ok(out_extents)
     }
 
     /// Prime the final streaming merge heap from `self.run_readers`.
@@ -1260,7 +1250,7 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         let mut child = self.child.take().unwrap();
         let mut chunk: Vec<Row> = Vec::new();
         let mut chunk_mem = 0usize;
-        let mut runs: Vec<(u64, u64)> = Vec::new();
+        let mut runs: Vec<Vec<(u64, u64)>> = Vec::new();
 
         loop {
             match child.next()? {
@@ -1268,7 +1258,8 @@ impl<R: Read, W: Write> SortOperator<R, W> {
                     let row_mem = row.exact_mem_size();
                     if !chunk.is_empty() && chunk_mem.saturating_add(row_mem) > budget {
                         Self::sort_slice(&mut chunk, &self.sort_specs, &self.schema);
-                        runs.push(self.write_run(&chunk)?);
+                        let (start, n) = self.write_run(&chunk)?;
+                        runs.push(vec![(start, n)]);
                         chunk = Vec::new();
                         chunk_mem = 0;
                     }
@@ -1287,7 +1278,8 @@ impl<R: Read, W: Write> SortOperator<R, W> {
             // Flush the tail chunk as the last run (if non-empty)
             if !chunk.is_empty() {
                 Self::sort_slice(&mut chunk, &self.sort_specs, &self.schema);
-                runs.push(self.write_run(&chunk)?);
+                let (start, n) = self.write_run(&chunk)?;
+                runs.push(vec![(start, n)]);
             }
             drop(chunk); // free before merge
 
@@ -1305,8 +1297,10 @@ impl<R: Read, W: Write> SortOperator<R, W> {
                 for batch in runs.chunks(fan_in) {
                     merged.push(self.merge_runs_to_disk(batch)?);
                     // Input runs are fully consumed; return their blocks for reuse.
-                    for &(start, n) in batch {
-                        self.anon_allocator.free(start, n);
+                    for run in batch {
+                        for &(start, n) in run {
+                            self.anon_allocator.free(start, n);
+                        }
                     }
                 }
                 runs = merged;
@@ -1314,9 +1308,9 @@ impl<R: Read, W: Write> SortOperator<R, W> {
 
             // Final pass: set up streaming k-way merge via BinaryHeap
             let cols = self.schema.columns().to_vec();
-            for (start, n) in runs {
-                self.run_readers.push(RunReader::new(
-                    self.disk_access.clone(), cols.clone(), self.block_size, start, n,
+            for run_extents in runs {
+                self.run_readers.push(SegmentedRunReader::new(
+                    self.disk_access.clone(), cols.clone(), self.block_size, run_extents,
                 ));
             }
             self.prime_merge_heap()?;
@@ -1364,8 +1358,8 @@ impl<R: Read, W: Write> Operator for SortOperator<R, W> {
 impl<R: Read, W: Write> Drop for SortOperator<R, W> {
     fn drop(&mut self) {
         for rr in &self.run_readers {
-            if rr.num_blocks > 0 {
-                self.anon_allocator.free(rr.start_block, rr.num_blocks);
+            for &(start, count) in &rr.extents {
+                self.anon_allocator.free(start, count);
             }
         }
         self.run_readers.clear();
