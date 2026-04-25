@@ -3,11 +3,11 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use anyhow::{Result, anyhow};
 use common::{Data, DataType};
-use common::query::{ComparisionOperator, ComparisionValue, JoinAlgorithm, JoinData, Predicate, QueryOp, SortSpec};
+use common::query::{ComparisionOperator, ComparisionValue, JoinAlgorithm, Predicate, QueryOp, SortSpec};
 use crate::catalog::{Catalog, ColumnCatalog, TableCatalog};
 use crate::disk_access::DiskAccessLayer;
 use crate::row::{Row, data_compare, encode_row};
-use crate::block_codec::{decode_block, encode_rows_to_blocks};
+use crate::block_codec::decode_block;
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -181,9 +181,29 @@ impl AnonBlockAllocator {
 
     /// Return `count` blocks starting at `start` to the free list for reuse.
     pub fn free(&self, start: u64, count: u64) {
-        if count > 0 {
-            self.free_list.lock().unwrap().push((start, count));
+        if count == 0 {
+            return;
         }
+
+        let mut free = self.free_list.lock().unwrap();
+        free.push((start, count));
+        free.sort_unstable_by_key(|(s, _)| *s);
+
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(free.len());
+        for (seg_start, seg_count) in free.drain(..) {
+            let seg_end = seg_start.saturating_add(seg_count);
+            if let Some((last_start, last_count)) = merged.last_mut() {
+                let last_end = last_start.saturating_add(*last_count);
+                if seg_start <= last_end {
+                    let new_end = last_end.max(seg_end);
+                    *last_count = new_end.saturating_sub(*last_start);
+                    continue;
+                }
+            }
+            merged.push((seg_start, seg_count));
+        }
+
+        *free = merged;
     }
 
     /// Allocate `count` consecutive blocks from the sequential counter, ignoring
@@ -441,8 +461,8 @@ pub struct CrossOperator<R: Read, W: Write> {
     // Populated after spill
     initialized: bool,
     right_is_empty: bool,
-    right_start_block: u64,
     right_num_blocks: u64,
+    right_extents: Vec<(u64, u64)>,
 
     // B-NLJ iteration state
     left_chunk: Vec<Row>,           // buffered left rows for current outer pass
@@ -470,7 +490,8 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
             disk_access, block_size, anon_allocator, right_cols,
             memory_limit_bytes, predicates,
             initialized: false, right_is_empty: false,
-            right_start_block: 0, right_num_blocks: 0,
+            right_num_blocks: 0,
+            right_extents: Vec::new(),
             left_chunk: Vec::new(), left_exhausted: false,
             right_block_offset: 0,
             right_block_rows: Vec::new(),
@@ -481,14 +502,18 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
     /// Check all predicates against the merged row. Empty predicates → always true.
     fn row_passes(&self, row: &Row) -> Result<bool> {
         for pred in &self.predicates {
-            let col_idx = self.schema.get_index(&pred.column_name)
-                .ok_or_else(|| anyhow!("CrossOperator: column '{}' not found", pred.column_name))?;
+            let col_idx = match self.schema.get_index(&pred.column_name) {
+                Some(i) => i,
+                None => continue,
+            };
             let left_val = row.get(col_idx)
                 .ok_or_else(|| anyhow!("CrossOperator: row missing value at index {}", col_idx))?;
             let right_val: Data = match &pred.value {
                 ComparisionValue::Column(name) => {
-                    let idx = self.schema.get_index(name)
-                        .ok_or_else(|| anyhow!("CrossOperator: column '{}' not found", name))?;
+                    let idx = match self.schema.get_index(name) {
+                        Some(i) => i,
+                        None => continue,
+                    };
                     row.get(idx)
                         .ok_or_else(|| anyhow!("CrossOperator: row missing value at index {}", idx))?
                         .clone()
@@ -506,16 +531,7 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
         Ok(true)
     }
 
-    /// Estimate in-memory size of one left row (same logic as SortOperator).
-    fn left_row_size(&self) -> usize {
-        let mut s = 24usize;
-        for col in self.left.schema().columns() {
-            s += match col.data_type { DataType::String => 64, _ => 32 };
-        }
-        s
-    }
-
-    /// How many left rows to buffer per chunk.
+    /// Byte budget for the left chunk.
     ///
     /// Unlike SortOperator there is no double-allocation proportional to
     /// chunk size: the right spill uses a fixed block_buf (~4 KB) that is
@@ -533,7 +549,7 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
     /// 64 MB limit  → 48 MB available (75 %)
     /// 256 MB limit → 240 MB available (94 %)
     /// 
-    fn left_chunk_capacity(&self) -> usize {
+    fn left_chunk_budget_bytes(&self) -> usize {
         const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
         // Reserve one decoded right block (read_block_with_prefetch) + small extras.
         let right_buf = self.block_size * 4;
@@ -541,8 +557,7 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
             .saturating_sub(PROCESS_OVERHEAD)
             .saturating_sub(right_buf);
         // 70% headroom: actual process overhead is ~40 MB; 32 MB + 30% slack covers it.
-        let budget = (usable as usize) * 70 / 100;
-        (budget / self.left_row_size()).max(64)
+        ((usable as usize) * 70 / 100).max(1)
     }
 
     // ------------------------------------------------------------------
@@ -557,8 +572,6 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
         let mut batch        = vec![0u8; batch_bytes];
         let mut in_batch     = 0usize;
         let mut total_blocks = 0u64;
-        let mut first_block  = 0u64;
-        let mut got_first    = false;
         let mut has_any_row  = false;
 
         let mut block        = vec![0u8; bs];
@@ -583,8 +596,8 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
                 in_batch += 1;
                 if in_batch == BATCH_BLOCKS {
                     let n  = in_batch as u64;
-                    let id = self.anon_allocator.allocate_sequential(n);
-                    if !got_first { first_block = id; got_first = true; }
+                    let id = self.anon_allocator.allocate(n);
+                    push_extent(&mut self.right_extents, id, n);
                     self.disk_access.lock().unwrap().write_blocks(id, n, &batch)?;
                     total_blocks += n; in_batch = 0;
                 }
@@ -609,13 +622,12 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
         }
         if in_batch > 0 {
             let n  = in_batch as u64;
-            let id = self.anon_allocator.allocate_sequential(n);
-            if !got_first { first_block = id; }
+            let id = self.anon_allocator.allocate(n);
+            push_extent(&mut self.right_extents, id, n);
             self.disk_access.lock().unwrap().write_blocks(id, n, &batch[..in_batch * bs])?;
             total_blocks += n;
         }
 
-        self.right_start_block = first_block;
         self.right_num_blocks  = total_blocks;
         Ok(())
     }
@@ -624,13 +636,21 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
     // Phase 2 helpers
     // ------------------------------------------------------------------
 
-    /// Fill left_chunk with up to left_chunk_capacity rows from the left child.
+    /// Fill left_chunk while staying under the byte budget.
     fn fill_left_chunk(&mut self) -> Result<()> {
         self.left_chunk.clear();
-        let cap = self.left_chunk_capacity();
-        while self.left_chunk.len() < cap {
+        let budget = self.left_chunk_budget_bytes();
+        let mut used = 0usize;
+        loop {
             match self.left.next()? {
-                Some(row) => self.left_chunk.push(row),
+                Some(row) => {
+                    let sz = row.exact_mem_size();
+                    if !self.left_chunk.is_empty() && used.saturating_add(sz) > budget {
+                        break;
+                    }
+                    used = used.saturating_add(sz);
+                    self.left_chunk.push(row);
+                }
                 None      => { self.left_exhausted = true; break; }
             }
         }
@@ -639,9 +659,19 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
 
     /// Load right block at `offset` into right_block_rows; reset right_row_idx.
     fn load_right_block(&mut self, offset: u64) -> Result<()> {
-        let id   = self.right_start_block + offset;
-        let remaining = self.right_num_blocks.saturating_sub(offset);
-        let prefetch  = remaining.min(PREFETCH_SIZE);
+        let mut logical = offset;
+        let mut id = None;
+        let mut remaining_in_extent = 0u64;
+        for (start, len) in &self.right_extents {
+            if logical < *len {
+                id = Some(*start + logical);
+                remaining_in_extent = *len - logical;
+                break;
+            }
+            logical -= *len;
+        }
+        let id = id.ok_or_else(|| anyhow!("CrossOperator: right block offset {} out of range", offset))?;
+        let prefetch = remaining_in_extent.min(PREFETCH_SIZE).max(1);
         let data = { self.disk_access.lock().unwrap().read_block_with_prefetch(id, prefetch)? };
         self.right_block_rows = decode_block(&data, self.block_size, &self.right_cols)?;
         self.right_row_idx    = 0;
@@ -718,6 +748,15 @@ impl<R: Read, W: Write> Operator for CrossOperator<R, W> {
     }
 }
 
+impl<R: Read, W: Write> Drop for CrossOperator<R, W> {
+    fn drop(&mut self) {
+        for (start, count) in self.right_extents.drain(..) {
+            self.anon_allocator.free(start, count);
+        }
+        self.right_num_blocks = 0;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SortOperator  (external merge sort via anonymous disk blocks)
 // ---------------------------------------------------------------------------
@@ -732,6 +771,97 @@ struct RunReader<R: Read, W: Write> {
     blocks_read: u64,
     current_rows: Vec<Row>,
     row_idx: usize,
+}
+
+/// Reads one spilled run from possibly non-contiguous anonymous disk extents.
+///
+/// Extents are written in allocation order and replayed in that same logical
+/// order. Each extent itself is contiguous and fetched in small prefetch chunks.
+struct SegmentedRunReader<R: Read, W: Write> {
+    disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
+    columns: Vec<ColumnCatalog>,
+    block_size: u64,
+    extents: Vec<(u64, u64)>,
+    extent_idx: usize,
+    blocks_read_in_extent: u64,
+    current_rows: Vec<Row>,
+    row_idx: usize,
+}
+
+impl<R: Read, W: Write> SegmentedRunReader<R, W> {
+    fn new(
+        disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
+        columns: Vec<ColumnCatalog>,
+        block_size: u64,
+        extents: Vec<(u64, u64)>,
+    ) -> Self {
+        Self {
+            disk_access,
+            columns,
+            block_size,
+            extents,
+            extent_idx: 0,
+            blocks_read_in_extent: 0,
+            current_rows: Vec::new(),
+            row_idx: 0,
+        }
+    }
+
+    fn next_row(&mut self) -> Result<Option<Row>> {
+        loop {
+            if self.row_idx < self.current_rows.len() {
+                let row = self.current_rows[self.row_idx].clone();
+                self.row_idx += 1;
+                return Ok(Some(row));
+            }
+
+            while self.extent_idx < self.extents.len() {
+                let (start, len) = self.extents[self.extent_idx];
+                if self.blocks_read_in_extent >= len {
+                    self.extent_idx += 1;
+                    self.blocks_read_in_extent = 0;
+                    continue;
+                }
+
+                let remaining = len - self.blocks_read_in_extent;
+                let fetch = remaining.min(RUN_PREFETCH_SIZE);
+                let block_id = start + self.blocks_read_in_extent;
+                let data = {
+                    let mut disk = self.disk_access.lock().unwrap();
+                    disk.read_blocks(block_id, fetch)?
+                };
+                let bs = self.block_size as usize;
+                let mut all_rows = Vec::new();
+                for i in 0..fetch as usize {
+                    let slice = &data[i * bs..(i + 1) * bs];
+                    let mut block_rows = decode_block(slice, self.block_size, &self.columns)?;
+                    all_rows.append(&mut block_rows);
+                }
+                self.current_rows = all_rows;
+                self.row_idx = 0;
+                self.blocks_read_in_extent += fetch;
+                break;
+            }
+
+            if self.row_idx >= self.current_rows.len() {
+                return Ok(None);
+            }
+        }
+    }
+}
+
+fn push_extent(extents: &mut Vec<(u64, u64)>, start: u64, count: u64) {
+    if count == 0 {
+        return;
+    }
+    if let Some((last_start, last_count)) = extents.last_mut() {
+        let last_end = *last_start + *last_count;
+        if last_end == start {
+            *last_count += count;
+            return;
+        }
+    }
+    extents.push((start, count));
 }
 
 impl<R: Read, W: Write> RunReader<R, W> {
@@ -1098,7 +1228,6 @@ impl<R: Read, W: Write> SortOperator<R, W> {
     }
 
     fn initialize(&mut self) -> Result<()> {
-        let row_size = self.row_mem_estimate();
         // Sorting chunk budget.
         //
         // write_run now encodes and flushes one block at a time (peak extra
@@ -1118,29 +1247,33 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         // is kept as a safety margin for the portal's larger shared-lib set.
         const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
         let usable = self.memory_limit_bytes.saturating_sub(PROCESS_OVERHEAD);
-        let budget = (usable as usize) * 70 / 100;
-        if budget < row_size {
+        // Use a conservative fraction because parent Sort buffers rows while
+        // child operators (notably Cross/SMJ) may hold their own chunks.
+        let budget = (usable as usize) * 40 / 100;
+        if budget == 0 {
             anyhow::bail!(
-                "SortOperator: memory limit ({} bytes) too small to hold even one row (~{} bytes estimated)",
-                self.memory_limit_bytes,
-                row_size
+                "SortOperator: memory limit ({} bytes) too small after overhead reservation",
+                self.memory_limit_bytes
             );
         }
-        let chunk_capacity = (budget / row_size).max(1);
 
         let mut child = self.child.take().unwrap();
-        let mut chunk: Vec<Row> = Vec::with_capacity(chunk_capacity);
+        let mut chunk: Vec<Row> = Vec::new();
+        let mut chunk_mem = 0usize;
         let mut runs: Vec<(u64, u64)> = Vec::new();
 
         loop {
             match child.next()? {
                 Some(row) => {
-                    chunk.push(row);
-                    if chunk.len() >= chunk_capacity {
+                    let row_mem = row.exact_mem_size();
+                    if !chunk.is_empty() && chunk_mem.saturating_add(row_mem) > budget {
                         Self::sort_slice(&mut chunk, &self.sort_specs, &self.schema);
                         runs.push(self.write_run(&chunk)?);
-                        chunk.clear();
+                        chunk = Vec::new();
+                        chunk_mem = 0;
                     }
+                    chunk_mem = chunk_mem.saturating_add(row_mem);
+                    chunk.push(row);
                 }
                 None => break,
             }
@@ -1228,6 +1361,17 @@ impl<R: Read, W: Write> Operator for SortOperator<R, W> {
     }
 }
 
+impl<R: Read, W: Write> Drop for SortOperator<R, W> {
+    fn drop(&mut self) {
+        for rr in &self.run_readers {
+            if rr.num_blocks > 0 {
+                self.anon_allocator.free(rr.start_block, rr.num_blocks);
+            }
+        }
+        self.run_readers.clear();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SortMergeJoinOperator
 //
@@ -1275,9 +1419,9 @@ pub struct SortMergeJoinOperator<R: Read, W: Write> {
 
     // Right equal-group — disk path
     right_group_on_disk:    bool,
-    right_group_start_block: u64,
     right_group_num_blocks:  u64,
-    right_group_disk_reader: Option<RunReader<R, W>>,
+    right_group_extents: Vec<(u64, u64)>,
+    right_group_disk_reader: Option<SegmentedRunReader<R, W>>,
 }
 
 impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
@@ -1347,7 +1491,8 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
             cur_left: None, right_peek: None,
             right_group_ram: Vec::new(), right_group_idx: 0,
             right_group_on_disk: false,
-            right_group_start_block: 0, right_group_num_blocks: 0,
+            right_group_num_blocks: 0,
+            right_group_extents: Vec::new(),
             right_group_disk_reader: None,
         })
     }
@@ -1409,8 +1554,10 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
     fn load_right_group(&mut self, first_row: Row) -> Result<()> {
         // Release the previous group's anonymous disk blocks before overwriting
         // the tracking fields, so those blocks can be reused by the allocator.
-        if self.right_group_on_disk && self.right_group_num_blocks > 0 {
-            self.anon_allocator.free(self.right_group_start_block, self.right_group_num_blocks);
+        if self.right_group_on_disk {
+            for (start, count) in self.right_group_extents.drain(..) {
+                self.anon_allocator.free(start, count);
+            }
         }
 
         let key      = self.extract_right_key(&first_row);
@@ -1419,8 +1566,8 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
         self.right_group_ram.clear();
         self.right_group_idx      = 0;
         self.right_group_on_disk  = false;
-        self.right_group_start_block = 0;
         self.right_group_num_blocks  = 0;
+        self.right_group_extents.clear();
         self.right_group_disk_reader = None;
 
         self.right_group_ram.push(first_row);
@@ -1452,8 +1599,6 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
         let mut batch    = vec![0u8; batch_bytes];
         let mut in_batch = 0usize;
         let mut total_blks = 0u64;
-        let mut first_blk  = 0u64;
-        let mut got_first  = false;
 
         let mut block    = vec![0u8; bs];
         let mut blk_off  = 0usize;
@@ -1470,8 +1615,8 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
                     in_batch += 1;
                     if in_batch == BATCH_BLOCKS {
                         let n  = in_batch as u64;
-                        let id = self.anon_allocator.allocate_sequential(n);
-                        if !got_first { first_blk = id; got_first = true; }
+                        let id = self.anon_allocator.allocate(n);
+                        push_extent(&mut self.right_group_extents, id, n);
                         self.disk_access.lock().unwrap().write_blocks(id, n, &batch)?;
                         total_blks += n; in_batch = 0;
                     }
@@ -1511,17 +1656,16 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
         }
         if in_batch > 0 {
             let n  = in_batch as u64;
-            let id = self.anon_allocator.allocate_sequential(n);
-            if !got_first { first_blk = id; }
+            let id = self.anon_allocator.allocate(n);
+            push_extent(&mut self.right_group_extents, id, n);
             self.disk_access.lock().unwrap().write_blocks(id, n, &batch[..in_batch * bs])?;
             total_blks += n;
         }
 
-        self.right_group_start_block = first_blk;
         self.right_group_num_blocks  = total_blks;
-        self.right_group_disk_reader = Some(RunReader::new(
+        self.right_group_disk_reader = Some(SegmentedRunReader::new(
             self.disk_access.clone(), self.right_cols.clone(),
-            self.block_size, first_blk, total_blks,
+            self.block_size, self.right_group_extents.clone(),
         ));
         Ok(())
     }
@@ -1530,10 +1674,9 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
     /// with the same join key).
     fn reset_right_group(&mut self) {
         if self.right_group_on_disk {
-            self.right_group_disk_reader = Some(RunReader::new(
+            self.right_group_disk_reader = Some(SegmentedRunReader::new(
                 self.disk_access.clone(), self.right_cols.clone(),
-                self.block_size,
-                self.right_group_start_block, self.right_group_num_blocks,
+                self.block_size, self.right_group_extents.clone(),
             ));
         } else {
             self.right_group_idx = 0;
@@ -1662,6 +1805,17 @@ impl<R: Read, W: Write> Operator for SortMergeJoinOperator<R, W> {
     }
 }
 
+impl<R: Read, W: Write> Drop for SortMergeJoinOperator<R, W> {
+    fn drop(&mut self) {
+        if self.right_group_on_disk {
+            for (start, count) in self.right_group_extents.drain(..) {
+                self.anon_allocator.free(start, count);
+            }
+        }
+        self.right_group_num_blocks = 0;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // build_operator  —  recursively turn a QueryOp tree into Operator boxes
 // ---------------------------------------------------------------------------
@@ -1674,6 +1828,56 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
     memory_limit_bytes: u64,
     anon_allocator: &AnonBlockAllocator,
 ) -> Result<Box<dyn Operator>> {
+    fn build_cross_subtree_with_predicates<R: Read + 'static, W: Write + 'static>(
+        op: &QueryOp,
+        predicates: &[Predicate],
+        catalog: &Catalog,
+        disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
+        block_size: u64,
+        memory_limit_bytes: u64,
+        anon_allocator: &AnonBlockAllocator,
+    ) -> Result<Box<dyn Operator>> {
+        match op {
+            QueryOp::Cross(d) => {
+                let left = build_cross_subtree_with_predicates(
+                    &d.left,
+                    predicates,
+                    catalog,
+                    disk_access.clone(),
+                    block_size,
+                    memory_limit_bytes,
+                    anon_allocator,
+                )?;
+                let right = build_cross_subtree_with_predicates(
+                    &d.right,
+                    predicates,
+                    catalog,
+                    disk_access.clone(),
+                    block_size,
+                    memory_limit_bytes,
+                    anon_allocator,
+                )?;
+                Ok(Box::new(CrossOperator::new(
+                    left,
+                    right,
+                    disk_access,
+                    block_size,
+                    memory_limit_bytes,
+                    anon_allocator.clone(),
+                    predicates.to_vec(),
+                )))
+            }
+            _ => build_operator(
+                op,
+                catalog,
+                disk_access,
+                block_size,
+                memory_limit_bytes,
+                anon_allocator,
+            ),
+        }
+    }
+
     match op {
         QueryOp::Scan(d) => {
             let table = catalog.get_table(&d.table_id)
@@ -1682,6 +1886,17 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
         }
 
         QueryOp::Filter(d) => {
+            if let QueryOp::Cross(_) = &*d.underlying {
+                return build_cross_subtree_with_predicates(
+                    &d.underlying,
+                    &d.predicates,
+                    catalog,
+                    disk_access,
+                    block_size,
+                    memory_limit_bytes,
+                    anon_allocator,
+                );
+            }
             let child = build_operator(
                 &d.underlying, catalog, disk_access, block_size, memory_limit_bytes, anon_allocator,
             )?;
@@ -1689,6 +1904,46 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
         }
 
         QueryOp::Project(d) => {
+            if let QueryOp::Sort(s) = &*d.underlying {
+                let mut needed: Vec<String> = Vec::new();
+                for (from, _) in &d.column_name_map {
+                    if !needed.iter().any(|c| c == from) {
+                        needed.push(from.clone());
+                    }
+                }
+                for spec in &s.sort_specs {
+                    if !needed.iter().any(|c| c == &spec.column_name) {
+                        needed.push(spec.column_name.clone());
+                    }
+                }
+
+                let child = build_operator(
+                    &s.underlying,
+                    catalog,
+                    disk_access.clone(),
+                    block_size,
+                    memory_limit_bytes,
+                    anon_allocator,
+                )?;
+
+                let identity_map: Vec<(String, String)> = needed
+                    .into_iter()
+                    .map(|name| (name.clone(), name))
+                    .collect();
+                let narrowed_child: Box<dyn Operator> = Box::new(ProjectOperator::new(child, identity_map)?);
+
+                let sort_op: Box<dyn Operator> = Box::new(SortOperator::new(
+                    narrowed_child,
+                    s.sort_specs.clone(),
+                    disk_access,
+                    block_size,
+                    memory_limit_bytes,
+                    anon_allocator.clone(),
+                ));
+
+                return Ok(Box::new(ProjectOperator::new(sort_op, d.column_name_map.clone())?));
+            }
+
             let child = build_operator(
                 &d.underlying, catalog, disk_access, block_size, memory_limit_bytes, anon_allocator,
             )?;
@@ -1716,8 +1971,6 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
             let left  = build_operator(&d.left,  catalog, disk_access.clone(), block_size, memory_limit_bytes, anon_allocator)?;
             let right = build_operator(&d.right, catalog, disk_access.clone(), block_size, memory_limit_bytes, anon_allocator)?;
             match d.algorithm {
-                JoinAlgorithm::BNlj =>
-                    Ok(Box::new(CrossOperator::new(left, right, disk_access, block_size, memory_limit_bytes, anon_allocator.clone(), d.predicates.clone()))),
                 JoinAlgorithm::SortMerge =>
                     Ok(Box::new(SortMergeJoinOperator::new(left, right, disk_access, block_size, memory_limit_bytes, anon_allocator.clone(), d.predicates.clone())?)),
             }

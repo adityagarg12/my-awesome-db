@@ -58,6 +58,21 @@ impl Row {
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
+
+    /// Approximate heap-backed memory held by this row instance.
+    ///
+    /// Includes the `Vec<Data>` backing storage and string payload capacities.
+    /// Used for conservative operator buffering decisions.
+    pub fn exact_mem_size(&self) -> usize {
+        let mut bytes = std::mem::size_of::<Self>();
+        bytes += self.values.capacity() * std::mem::size_of::<Data>();
+        for v in &self.values {
+            if let Data::String(s) = v {
+                bytes += s.capacity();
+            }
+        }
+        bytes
+    }
 }
 
 pub fn decode_row(

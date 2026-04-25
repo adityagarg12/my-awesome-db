@@ -268,7 +268,7 @@ fn build_join_tree(inputs: Vec<QueryOp>, predicates: Vec<Predicate>, catalog: &C
                 left:       Box::new(current),
                 right:      Box::new(next),
                 predicates: applicable_eq,
-                algorithm:  JoinAlgorithm::BNlj, // upgraded to SMJ by select_join_algorithm
+                algorithm:  JoinAlgorithm::SortMerge,
             })
         };
 
@@ -399,8 +399,14 @@ fn select_join_algorithm(op: QueryOp, catalog: &Catalog) -> QueryOp {
     let (left_key, right_key) = extract_join_key_cols(&d.predicates, &d.left, &d.right, catalog);
 
     if left_key.is_empty() {
-        // No equi-join keys found — can't use SMJ, keep B-NLJ
-        return QueryOp::Join(d);
+        // Defensive rewrite: preserve semantics without introducing a BNLJ fallback.
+        return QueryOp::Filter(FilterData {
+            underlying: Box::new(QueryOp::Cross(CrossData {
+                left: d.left,
+                right: d.right,
+            })),
+            predicates: d.predicates,
+        });
     }
 
     let left_specs  = make_sort_specs(&left_key);
