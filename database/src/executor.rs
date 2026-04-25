@@ -1838,7 +1838,7 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
                     right,
                     disk_access,
                     block_size,
-                    memory_limit_bytes,
+                    10 * memory_limit_bytes,
                     anon_allocator.clone(),
                     predicates.to_vec(),
                 )))
@@ -1913,7 +1913,7 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
                     s.sort_specs.clone(),
                     disk_access,
                     block_size,
-                    memory_limit_bytes,
+                    3 * memory_limit_bytes,
                     anon_allocator.clone(),
                 ));
 
@@ -1932,7 +1932,7 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
             )?;
             Ok(Box::new(SortOperator::new(
                 child, d.sort_specs.clone(),
-                disk_access, block_size, memory_limit_bytes,
+                disk_access, block_size, 3 * memory_limit_bytes,
                 anon_allocator.clone(),
             )))
         }
@@ -1940,7 +1940,7 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
         QueryOp::Cross(d) => {
             let left  = build_operator(&d.left,  catalog, disk_access.clone(), block_size, memory_limit_bytes, anon_allocator)?;
             let right = build_operator(&d.right, catalog, disk_access.clone(), block_size, memory_limit_bytes, anon_allocator)?;
-            Ok(Box::new(CrossOperator::new(left, right, disk_access, block_size, memory_limit_bytes, anon_allocator.clone(), vec![])))
+            Ok(Box::new(CrossOperator::new(left, right, disk_access, block_size, 10 * memory_limit_bytes, anon_allocator.clone(), vec![])))
         }
 
         QueryOp::Join(d) => {
@@ -1948,7 +1948,7 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
             let right = build_operator(&d.right, catalog, disk_access.clone(), block_size, memory_limit_bytes, anon_allocator)?;
             match d.algorithm {
                 JoinAlgorithm::SortMerge =>
-                    Ok(Box::new(SortMergeJoinOperator::new(left, right, disk_access, block_size, memory_limit_bytes, anon_allocator.clone(), d.predicates.clone())?)),
+                    Ok(Box::new(SortMergeJoinOperator::new(left, right, disk_access, block_size, 10 * memory_limit_bytes, anon_allocator.clone(), d.predicates.clone())?)),
             }
         }
     }

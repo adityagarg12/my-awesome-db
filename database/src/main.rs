@@ -24,13 +24,15 @@ mod io_setup;
 mod optimizer;
 mod row;
 
-fn count_stateful_operators(op: &QueryOp) -> u64 {
+fn get_operator_weight_units(op: &QueryOp) -> u64 {
     match op {
-        QueryOp::Sort(d) => 1 + count_stateful_operators(&d.underlying),
-        QueryOp::Cross(d) => 1 + count_stateful_operators(&d.left) + count_stateful_operators(&d.right),
-        QueryOp::Join(d) => 1 + count_stateful_operators(&d.left) + count_stateful_operators(&d.right),
-        QueryOp::Filter(d) => count_stateful_operators(&d.underlying),
-        QueryOp::Project(d) => count_stateful_operators(&d.underlying),
+        // Sort keeps merge heap + run-reader state while parent operators pull.
+        QueryOp::Sort(d) => 3 + get_operator_weight_units(&d.underlying),
+        // Joins/Crosses tend to hold the highest concurrent row-buffer pressure.
+        QueryOp::Cross(d) => 10 + get_operator_weight_units(&d.left) + get_operator_weight_units(&d.right),
+        QueryOp::Join(d) => 10 + get_operator_weight_units(&d.left) + get_operator_weight_units(&d.right),
+        QueryOp::Filter(d) => get_operator_weight_units(&d.underlying),
+        QueryOp::Project(d) => get_operator_weight_units(&d.underlying),
         QueryOp::Scan(_) => 0,
     }
 }
@@ -85,14 +87,14 @@ fn db_main() -> Result<()> {
 
     // 4. Optimize query tree, then build operator tree
     let optimized = optimize(query.root, &catalog);
-    let stateful_count = count_stateful_operators(&optimized).max(1);
-    let per_operator_memory_limit = (operator_memory_limit / stateful_count).max(block_size * 8);
+    let total_weight_units = get_operator_weight_units(&optimized).max(1);
+    let bytes_per_weight_unit = (operator_memory_limit / total_weight_units).max(block_size);
     let mut root_op = build_operator(
         &optimized,
         &catalog,
         disk_access,
         block_size,
-        per_operator_memory_limit,
+        bytes_per_weight_unit,
         &anon_allocator,
     )?;
 
