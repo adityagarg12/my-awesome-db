@@ -94,14 +94,11 @@ const PREFETCH_SIZE: u64 = 16;
 // keeping peak extra allocation small and independent of chunk/table size.
 const BATCH_BLOCKS: usize = 256;
 
-// Blocks fetched per read_blocks IPC call inside RunReader.
-// Smaller than PREFETCH_SIZE (16) so that merge_fan_in can stay large:
-// each RunReader holds at most RUN_PREFETCH_SIZE decoded blocks in RAM.
-// Worst-case decoded memory per reader = RUN_PREFETCH_SIZE × block_size × 8
-// (factor 8 = Int32 encoded 4 B → Data enum 32 B).  With 4 blocks that's
-// 128 KB/reader, giving fan_in ≈ 240 at 64 MB — well above the number of
-// runs any realistic dataset produces at this memory limit.
-const RUN_PREFETCH_SIZE: u64 = 4;
+// Blocks fetched per read_blocks IPC call inside SegmentedRunReader.
+// Raw bytes are held in a prefetch buffer; only ONE block is decoded at a time,
+// keeping decoded memory per reader at block_size×8 regardless of this value.
+// Larger values reduce disk round-trips without ballooning in-RAM decoded data.
+const RUN_PREFETCH_SIZE: u64 = 16;
 
 /// Encoded byte length of one row without allocating any buffer.
 /// Must stay in sync with encode_row / encode_value in row.rs.
@@ -786,6 +783,9 @@ struct SegmentedRunReader<R: Read, W: Write> {
     blocks_read_in_extent: u64,
     current_rows: Vec<Row>,
     row_idx: usize,
+    raw_buf: Vec<u8>,   // raw prefetched bytes not yet decoded
+    raw_decoded: u64,   // blocks from raw_buf already decoded
+    raw_total: u64,     // blocks currently in raw_buf
 }
 
 impl<R: Read, W: Write> SegmentedRunReader<R, W> {
@@ -804,47 +804,54 @@ impl<R: Read, W: Write> SegmentedRunReader<R, W> {
             blocks_read_in_extent: 0,
             current_rows: Vec::new(),
             row_idx: 0,
+            raw_buf: Vec::new(),
+            raw_decoded: 0,
+            raw_total: 0,
         }
     }
 
     fn next_row(&mut self) -> Result<Option<Row>> {
         loop {
+            // Serve from already-decoded rows.
             if self.row_idx < self.current_rows.len() {
                 let row = self.current_rows[self.row_idx].clone();
                 self.row_idx += 1;
                 return Ok(Some(row));
             }
 
-            while self.extent_idx < self.extents.len() {
+            // Decode the next raw block from the prefetch buffer.
+            if self.raw_decoded < self.raw_total {
+                let bs = self.block_size as usize;
+                let start = self.raw_decoded as usize * bs;
+                let slice = &self.raw_buf[start..start + bs];
+                self.current_rows = decode_block(slice, self.block_size, &self.columns)?;
+                self.row_idx = 0;
+                self.raw_decoded += 1;
+                continue;
+            }
+
+            // Fetch the next batch of raw blocks from disk.
+            loop {
+                if self.extent_idx >= self.extents.len() {
+                    return Ok(None);
+                }
                 let (start, len) = self.extents[self.extent_idx];
                 if self.blocks_read_in_extent >= len {
                     self.extent_idx += 1;
                     self.blocks_read_in_extent = 0;
                     continue;
                 }
-
                 let remaining = len - self.blocks_read_in_extent;
                 let fetch = remaining.min(RUN_PREFETCH_SIZE);
                 let block_id = start + self.blocks_read_in_extent;
-                let data = {
+                self.raw_buf = {
                     let mut disk = self.disk_access.lock().unwrap();
                     disk.read_blocks(block_id, fetch)?
                 };
-                let bs = self.block_size as usize;
-                let mut all_rows = Vec::new();
-                for i in 0..fetch as usize {
-                    let slice = &data[i * bs..(i + 1) * bs];
-                    let mut block_rows = decode_block(slice, self.block_size, &self.columns)?;
-                    all_rows.append(&mut block_rows);
-                }
-                self.current_rows = all_rows;
-                self.row_idx = 0;
+                self.raw_decoded = 0;
+                self.raw_total = fetch;
                 self.blocks_read_in_extent += fetch;
                 break;
-            }
-
-            if self.row_idx >= self.current_rows.len() {
-                return Ok(None);
             }
         }
     }
@@ -1083,27 +1090,21 @@ impl<R: Read, W: Write> SortOperator<R, W> {
     /// Max number of runs we can merge simultaneously without exceeding the
     /// memory budget.
     ///
-    /// During a merge pass each RunReader holds one block's worth of decoded
-    /// rows in RAM (`current_rows`). The HeapEntry for each run adds one
-    /// key clone (small). One additional block_size buffer is needed
-    /// transiently when loading the next block (shared, not per-run).
+    /// Each SegmentedRunReader holds:
+    ///   - 1 decoded block  (block_size × 8, worst-case Int32 expansion)
+    ///   - (RUN_PREFETCH_SIZE − 1) raw blocks  (block_size each, not expanded)
+    ///   - a HeapEntry key clone
     ///
-    ///   per_run  ≈  block_size          (decoded rows ≈ one encoded block)
-    ///            +  sort_specs.len() × 48  (HeapEntry.key)
-    ///   fan_in   =  (available − block_size) / per_run
-    /// 
+    ///   per_run = (7 + RUN_PREFETCH_SIZE) × block_size + key_size
+    ///   fan_in  = (available − write_buf) / per_run
     fn merge_fan_in(&self) -> usize {
-        // Reserve BATCH_BLOCKS (1 MB) for the write buffer in merge_runs_to_disk.
         let write_buf = BATCH_BLOCKS as u64 * self.block_size;
         let available = self.memory_limit_bytes
             .saturating_sub(write_buf) as usize;
 
-        // Per RunReader: holds up to RUN_PREFETCH_SIZE decoded blocks.
-        // Decoded rows can be up to 8× larger than encoded (worst case: pure
-        // Int32 — 4 bytes encoded → 32-byte Data enum).  key_size covers the
-        // HeapEntry key cloned for each popped row.
+        // 1 decoded block (8× expansion) + (RUN_PREFETCH_SIZE-1) raw blocks (1× each).
         let key_size = 24 + self.sort_specs.len() * 40;
-        let per_run  = RUN_PREFETCH_SIZE as usize * self.block_size as usize * 8 + key_size;
+        let per_run  = (7 + RUN_PREFETCH_SIZE as usize) * self.block_size as usize + key_size;
         (available / per_run.max(1)).max(2)
     }
 
