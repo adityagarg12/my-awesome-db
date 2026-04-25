@@ -540,25 +540,15 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
     /// freed before B-NLJ begins, and the B-NLJ phase only holds the left
     /// chunk + one decoded right block simultaneously.
     ///
-    /// Process overhead (release binary ~12 MB, debug ~14 MB):
-    ///   text + data      : ~1.2 MB release / 2.7 MB debug
-    ///   shared libs      : ~2.5 MB (libc, libgcc)
-    ///   stack reservation: ~8 MB  (Linux default)
-    ///   heap metadata    : ~0.5 MB
-    ///   right block buf  : 4 × block_size (~16 KB, negligible)
-    ///
-    /// Reserve 16 MB for all overhead; give everything else to the left chunk.
-    /// 64 MB limit  → 48 MB available (75 %)
-    /// 256 MB limit → 240 MB available (94 %)
+    /// `memory_limit_bytes` is already a per-operator budget from main.rs.
+    /// Reserve right-side decode buffers and keep conservative headroom.
     /// 
     fn left_chunk_budget_bytes(&self) -> usize {
-        const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
         // Reserve one decoded right block (read_block_with_prefetch) + small extras.
         let right_buf = self.block_size * 4;
         let usable = self.memory_limit_bytes
-            .saturating_sub(PROCESS_OVERHEAD)
             .saturating_sub(right_buf);
-        // 70% headroom: actual process overhead is ~40 MB; 32 MB + 30% slack covers it.
+        // Headroom for temporary join rows and per-loop allocations.
         ((usable as usize) * 70 / 100).max(1)
     }
 
@@ -1103,11 +1093,9 @@ impl<R: Read, W: Write> SortOperator<R, W> {
     ///   fan_in   =  (available − block_size) / per_run
     /// 
     fn merge_fan_in(&self) -> usize {
-        const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
         // Reserve BATCH_BLOCKS (1 MB) for the write buffer in merge_runs_to_disk.
         let write_buf = BATCH_BLOCKS as u64 * self.block_size;
         let available = self.memory_limit_bytes
-            .saturating_sub(PROCESS_OVERHEAD)
             .saturating_sub(write_buf) as usize;
 
         // Per RunReader: holds up to RUN_PREFETCH_SIZE decoded blocks.
@@ -1231,12 +1219,8 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         //   - SMJ right-group rows held by parent operators
         //   - Other heap allocations in the pipeline
         //
-        // Process overhead accounts for: binary .text/.data, mmap'd shared
-        // libraries, stack reservation, heap metadata, and Rust runtime.
-        // Measured at ~12 MB (release) / ~14 MB (debug) at startup; 32 MB
-        // is kept as a safety margin for the portal's larger shared-lib set.
-        const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
-        let usable = self.memory_limit_bytes.saturating_sub(PROCESS_OVERHEAD);
+        // `memory_limit_bytes` is already a per-operator budget from main.rs.
+        let usable = self.memory_limit_bytes;
         // Use a conservative fraction because parent Sort buffers rows while
         // child operators (notably Cross/SMJ) may hold their own chunks.
         let budget = (usable as usize) * 40 / 100;
@@ -1373,7 +1357,7 @@ impl<R: Read, W: Write> Drop for SortOperator<R, W> {
 // The optimizer must insert Sort nodes below Join when choosing SMJ.
 //
 // Right equal-group memory policy:
-//   Budget  = memory_limit - PROCESS_OVERHEAD
+//   Budget  = per-operator memory budget from main.rs
 //   Max rows in RAM = budget / right_row_size  (conservative overestimate)
 //   If group fits → pure RAM, no disk I/O (fastest path)
 //   If group exceeds limit → spill every row to anonymous disk as it arrives,
@@ -1505,13 +1489,11 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
 
     /// Maximum right-group rows we can hold in RAM without exceeding budget.
     fn max_right_group_rows(&self) -> usize {
-        const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
         // Reserve BATCH_BLOCKS write buffer allocated simultaneously with ram_rows during spill.
         let write_buf = BATCH_BLOCKS as u64 * self.block_size;
         let usable = self.memory_limit_bytes
-            .saturating_sub(PROCESS_OVERHEAD)
             .saturating_sub(write_buf) as usize;
-        // 70% headroom: actual overhead exceeds 32 MB; slack prevents OOM under any dataset.
+        // Headroom for decode/compare state while probing this group.
         let budget = usable * 70 / 100;
         (budget / self.right_row_size()).max(1)
     }

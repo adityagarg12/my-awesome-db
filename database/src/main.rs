@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use common::query::Query;
+use common::query::{Query, QueryOp};
 use db_config::DbContext;
 use std::io::{BufRead, BufReader, Write};
 use std::sync::{Arc, Mutex};
@@ -23,6 +23,17 @@ mod executor;
 mod io_setup;
 mod optimizer;
 mod row;
+
+fn count_stateful_operators(op: &QueryOp) -> u64 {
+    match op {
+        QueryOp::Sort(d) => 1 + count_stateful_operators(&d.underlying),
+        QueryOp::Cross(d) => 1 + count_stateful_operators(&d.left) + count_stateful_operators(&d.right),
+        QueryOp::Join(d) => 1 + count_stateful_operators(&d.left) + count_stateful_operators(&d.right),
+        QueryOp::Filter(d) => count_stateful_operators(&d.underlying),
+        QueryOp::Project(d) => count_stateful_operators(&d.underlying),
+        QueryOp::Scan(_) => 0,
+    }
+}
 
 fn db_main() -> Result<()> {
     let cli_options = CliOptions::parse();
@@ -74,12 +85,14 @@ fn db_main() -> Result<()> {
 
     // 4. Optimize query tree, then build operator tree
     let optimized = optimize(query.root, &catalog);
+    let stateful_count = count_stateful_operators(&optimized).max(1);
+    let per_operator_memory_limit = (operator_memory_limit / stateful_count).max(block_size * 8);
     let mut root_op = build_operator(
         &optimized,
         &catalog,
         disk_access,
         block_size,
-        operator_memory_limit,
+        per_operator_memory_limit,
         &anon_allocator,
     )?;
 
