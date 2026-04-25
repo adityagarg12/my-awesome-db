@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use anyhow::{Result, bail};
 use common::DataType;
 use db_config::{DbContext, table::TableSpec};
+use db_config::statistics::ColumnStat;
 
 #[derive(Debug, Clone)]
 pub struct ColumnCatalog {
@@ -15,6 +16,7 @@ pub struct ColumnCatalog {
 pub struct TableCatalog {
     pub name: String,
     pub file_id: String,
+    pub num_rows: u64,   // max column cardinality — proxy for table row count
     columns: Vec<ColumnCatalog>,
     column_name_to_index: HashMap<String, usize>,
 }
@@ -111,9 +113,20 @@ impl Catalog {
             columns.push(column_catalog);
         }
 
+        let num_rows = table_spec.column_specs.iter()
+            .filter_map(|col| col.stats.as_deref())
+            .flat_map(|stats| stats.iter())
+            .filter_map(|stat| match stat {
+                ColumnStat::CardinalityStat(cd) => Some(cd.0),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(100_000);
+
         Ok(TableCatalog {
             name: table_spec.name.clone(),
             file_id: table_spec.file_id.clone(),
+            num_rows,
             columns,
             column_name_to_index,
         })

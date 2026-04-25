@@ -215,8 +215,17 @@ fn build_join_tree(inputs: Vec<QueryOp>, predicates: Vec<Predicate>, catalog: &C
     let mut col_sets = col_sets;
 
     // --- Greedy left-deep join tree construction ---
-    let mut current          = inputs.remove(0);
-    let mut joined_cols      = col_sets.remove(0);
+    // Start with the input that has the smallest estimated size so that the
+    // most selective tables anchor the join tree early.
+    let start_pos = (0..inputs.len())
+        .min_by(|&a, &b| {
+            let sa = estimate_op_size(&inputs[a], catalog);
+            let sb = estimate_op_size(&inputs[b], catalog);
+            sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(0);
+    let mut current          = inputs.remove(start_pos);
+    let mut joined_cols      = col_sets.remove(start_pos);
     let mut rem_equi         = equi_preds;
     let mut rem_residual     = residual;
 
@@ -227,15 +236,27 @@ fn build_join_tree(inputs: Vec<QueryOp>, predicates: Vec<Predicate>, catalog: &C
     };
 
     while !inputs.is_empty() {
-        // Pick the next input that bridges to the current joined set via an
-        // equi-join predicate. Fall back to index 0 (true cross product) if none.
-        let next_pos = (0..inputs.len())
-            .find(|&i| {
+        // Among all inputs that bridge to the current joined set via an equi-join,
+        // pick the one with the smallest estimated size (fewest output rows).
+        // This keeps highly-selective tables early and defers large unfiltered
+        // scans (e.g. a self-join lineitem) until the joined set is already small.
+        // If no equi-join bridge exists, pick the smallest input overall (cross).
+        let connected: Vec<usize> = (0..inputs.len())
+            .filter(|&i| {
                 rem_equi.iter().any(|p| {
                     let refs: HashSet<String> = predicate_columns(p).into_iter().collect();
                     refs.iter().any(|c| joined_cols.contains(c))
                         && refs.iter().any(|c| col_sets[i].contains(c))
                 })
+            })
+            .collect();
+
+        let candidates = if connected.is_empty() { (0..inputs.len()).collect::<Vec<_>>() } else { connected };
+        let next_pos = candidates.into_iter()
+            .min_by(|&a, &b| {
+                let sa = estimate_op_size(&inputs[a], catalog);
+                let sb = estimate_op_size(&inputs[b], catalog);
+                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
             })
             .unwrap_or(0);
 
@@ -557,6 +578,35 @@ fn narrow_join_inputs(
     let left  = push_projections(left,  Some(&left_needed),  catalog);
     let right = push_projections(right, Some(&right_needed), catalog);
     (left, right)
+}
+
+// ---------------------------------------------------------------------------
+// Size estimation
+// ---------------------------------------------------------------------------
+
+/// Rough estimated output row count for an operator sub-tree.
+///
+/// Used only for join ordering heuristics — accuracy matters less than
+/// relative ordering.  Per-predicate selectivity of 0.1 is conservative
+/// but reliably puts highly-filtered inputs before bare scans.
+fn estimate_op_size(op: &QueryOp, catalog: &Catalog) -> f64 {
+    match op {
+        QueryOp::Scan(d) => {
+            catalog.get_table(&d.table_id)
+                .map(|t| t.num_rows as f64)
+                .unwrap_or(100_000.0)
+        }
+        QueryOp::Filter(d) => {
+            let base = estimate_op_size(&d.underlying, catalog);
+            // Each predicate reduces the estimate by ~90 %.
+            base * 0.1f64.powi(d.predicates.len() as i32)
+        }
+        QueryOp::Project(d) => estimate_op_size(&d.underlying, catalog),
+        QueryOp::Sort(d)    => estimate_op_size(&d.underlying, catalog),
+        // For sub-join / sub-cross, fall back to a large constant so the
+        // optimizer doesn't try to reorder already-planned sub-trees.
+        _ => 100_000.0,
+    }
 }
 
 // ---------------------------------------------------------------------------
