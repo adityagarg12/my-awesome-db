@@ -328,48 +328,70 @@ impl<R: Read, W: Write> Operator for ScanOperator<R, W> {
 }
 
 // ---------------------------------------------------------------------------
+// Compiled predicates
+// ---------------------------------------------------------------------------
+
+enum CompiledValue {
+    Column(usize),
+    Literal(Data),
+}
+
+struct CompiledPredicate {
+    left_idx: usize,
+    operator: ComparisionOperator,
+    right_val: CompiledValue,
+}
+
+fn compile_predicates(predicates: &[Predicate], schema: &Schema) -> Vec<CompiledPredicate> {
+    predicates.iter().map(|pred| {
+        let left_idx = schema.get_index(&pred.column_name).unwrap_or(0);
+        let right_val = match &pred.value {
+            ComparisionValue::Column(name) => CompiledValue::Column(schema.get_index(name).unwrap_or(0)),
+            ComparisionValue::I32(v)       => CompiledValue::Literal(Data::Int32(*v)),
+            ComparisionValue::I64(v)       => CompiledValue::Literal(Data::Int64(*v)),
+            ComparisionValue::F32(v)       => CompiledValue::Literal(Data::Float32(*v)),
+            ComparisionValue::F64(v)       => CompiledValue::Literal(Data::Float64(*v)),
+            ComparisionValue::String(v)    => CompiledValue::Literal(Data::String(v.clone())),
+        };
+        CompiledPredicate { left_idx, operator: pred.operator.clone(), right_val }
+    }).collect()
+}
+
+fn eval_compiled_predicates(preds: &[CompiledPredicate], row: &Row) -> Result<bool> {
+    for pred in preds {
+        let left_val = row.get(pred.left_idx)
+            .ok_or_else(|| anyhow!("row missing value at index {}", pred.left_idx))?;
+        let right_val = match &pred.right_val {
+            CompiledValue::Column(idx) => row.get(*idx)
+                .ok_or_else(|| anyhow!("row missing value at index {}", idx))?,
+            CompiledValue::Literal(val) => val,
+        };
+        if !data_compare(left_val, right_val, &pred.operator)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
 // FilterOperator
 // ---------------------------------------------------------------------------
 
 pub struct FilterOperator {
     child: Box<dyn Operator>,
-    predicates: Vec<Predicate>,
+    compiled_preds: Vec<CompiledPredicate>,
     schema: Schema,
 }
 
 impl FilterOperator {
     pub fn new(child: Box<dyn Operator>, predicates: Vec<Predicate>) -> Self {
         let schema = child.schema().clone();
-        FilterOperator { child, predicates, schema }
+        let compiled_preds = compile_predicates(&predicates, &schema);
+        FilterOperator { child, compiled_preds, schema }
     }
 
     fn row_passes(&self, row: &Row) -> Result<bool> {
-        for pred in &self.predicates {
-            let col_idx = self.schema.get_index(&pred.column_name)
-                .ok_or_else(|| anyhow!("Filter: column '{}' not found", pred.column_name))?;
-            let left_val = row.get(col_idx)
-                .ok_or_else(|| anyhow!("Filter: row has no value at index {}", col_idx))?;
-
-            let right_val: Data = match &pred.value {
-                ComparisionValue::Column(name) => {
-                    let idx = self.schema.get_index(name)
-                        .ok_or_else(|| anyhow!("Filter: column '{}' not found", name))?;
-                    row.get(idx)
-                        .ok_or_else(|| anyhow!("Filter: row has no value at index {}", idx))?
-                        .clone()
-                }
-                ComparisionValue::I32(v)    => Data::Int32(*v),
-                ComparisionValue::I64(v)    => Data::Int64(*v),
-                ComparisionValue::F32(v)    => Data::Float32(*v),
-                ComparisionValue::F64(v)    => Data::Float64(*v),
-                ComparisionValue::String(v) => Data::String(v.clone()),
-            };
-
-            if !data_compare(left_val, &right_val, &pred.operator)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        eval_compiled_predicates(&self.compiled_preds, row)
     }
 }
 
@@ -451,9 +473,9 @@ pub struct CrossOperator<R: Read, W: Write> {
     anon_allocator: AnonBlockAllocator,
     right_cols: Vec<ColumnCatalog>,
     memory_limit_bytes: u64,
-    /// Join predicates pushed down from a parent Filter.
+    /// Compiled join predicates (indices pre-resolved at construction).
     /// Empty = pure cartesian product; non-empty = B-NLJ join.
-    predicates: Vec<Predicate>,
+    compiled_preds: Vec<CompiledPredicate>,
 
     // Populated after spill
     initialized: bool,
@@ -483,10 +505,11 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
     ) -> Self {
         let schema     = Schema::merge(left.schema(), right.schema());
         let right_cols = right.schema().columns().to_vec();
+        let compiled_preds = compile_predicates(&predicates, &schema);
         CrossOperator {
             left, right: Some(right), schema,
             disk_access, block_size, anon_allocator, right_cols,
-            memory_limit_bytes, predicates,
+            memory_limit_bytes, compiled_preds,
             initialized: false, right_is_empty: false,
             right_num_blocks: 0,
             right_extents: Vec::new(),
@@ -500,34 +523,7 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
 
     /// Check all predicates against the merged row. Empty predicates → always true.
     fn row_passes(&self, row: &Row) -> Result<bool> {
-        for pred in &self.predicates {
-            let col_idx = match self.schema.get_index(&pred.column_name) {
-                Some(i) => i,
-                None => continue,
-            };
-            let left_val = row.get(col_idx)
-                .ok_or_else(|| anyhow!("CrossOperator: row missing value at index {}", col_idx))?;
-            let right_val: Data = match &pred.value {
-                ComparisionValue::Column(name) => {
-                    let idx = match self.schema.get_index(name) {
-                        Some(i) => i,
-                        None => continue,
-                    };
-                    row.get(idx)
-                        .ok_or_else(|| anyhow!("CrossOperator: row missing value at index {}", idx))?
-                        .clone()
-                }
-                ComparisionValue::I32(v)    => Data::Int32(*v),
-                ComparisionValue::I64(v)    => Data::Int64(*v),
-                ComparisionValue::F32(v)    => Data::Float32(*v),
-                ComparisionValue::F64(v)    => Data::Float64(*v),
-                ComparisionValue::String(v) => Data::String(v.clone()),
-            };
-            if !data_compare(left_val, &right_val, &pred.operator)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        eval_compiled_predicates(&self.compiled_preds, row)
     }
 
     /// Byte budget for the left chunk.
@@ -949,6 +945,7 @@ impl Ord for HeapEntry {
 pub struct SortOperator<R: Read, W: Write> {
     child: Option<Box<dyn Operator>>,
     sort_specs: Vec<SortSpec>,
+    sort_key_indices: Vec<(usize, bool)>,  // pre-compiled from sort_specs
     schema: Schema,
     memory_limit_bytes: u64,
     disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
@@ -973,8 +970,11 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         anon_allocator: AnonBlockAllocator,
     ) -> Self {
         let schema = child.schema().clone();
+        let sort_key_indices = sort_specs.iter()
+            .map(|s| (schema.get_index(&s.column_name).unwrap_or(0), s.ascending))
+            .collect();
         SortOperator {
-            child: Some(child), sort_specs, schema,
+            child: Some(child), sort_specs, sort_key_indices, schema,
             memory_limit_bytes, disk_access, block_size, anon_allocator,
             initialized: false,
             in_memory_rows: Vec::new(), in_memory_idx: 0,
@@ -994,13 +994,12 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         size
     }
 
-    fn sort_slice(rows: &mut Vec<Row>, specs: &[SortSpec], schema: &Schema) {
+    fn sort_slice(rows: &mut Vec<Row>, key_indices: &[(usize, bool)]) {
         rows.sort_unstable_by(|a, b| {
-            for spec in specs {
-                let idx = schema.get_index(&spec.column_name).unwrap_or(0);
+            for &(idx, asc) in key_indices {
                 if let (Some(av), Some(bv)) = (a.get(idx), b.get(idx)) {
                     let ord = av.partial_cmp(bv).unwrap_or(std::cmp::Ordering::Equal);
-                    let ord = if spec.ascending { ord } else { ord.reverse() };
+                    let ord = if asc { ord } else { ord.reverse() };
                     if ord != std::cmp::Ordering::Equal { return ord; }
                 }
             }
@@ -1080,10 +1079,8 @@ impl<R: Read, W: Write> SortOperator<R, W> {
     }
 
     fn make_heap_key(&self, row: &Row) -> Vec<(Data, bool)> {
-        self.sort_specs.iter().map(|spec| {
-            let idx = self.schema.get_index(&spec.column_name).unwrap_or(0);
-            let val = row.get(idx).cloned().unwrap_or(Data::Int32(0));
-            (val, spec.ascending)
+        self.sort_key_indices.iter().map(|&(idx, asc)| {
+            (row.get(idx).cloned().unwrap_or(Data::Int32(0)), asc)
         }).collect()
     }
 
@@ -1242,7 +1239,7 @@ impl<R: Read, W: Write> SortOperator<R, W> {
                 Some(row) => {
                     let row_mem = row.exact_mem_size();
                     if !chunk.is_empty() && chunk_mem.saturating_add(row_mem) > budget {
-                        Self::sort_slice(&mut chunk, &self.sort_specs, &self.schema);
+                        Self::sort_slice(&mut chunk, &self.sort_key_indices);
                         let (start, n) = self.write_run(&chunk)?;
                         runs.push(vec![(start, n)]);
                         chunk = Vec::new();
@@ -1257,12 +1254,12 @@ impl<R: Read, W: Write> SortOperator<R, W> {
 
         if runs.is_empty() {
             // Everything fit in one chunk — pure in-memory sort, no disk needed
-            Self::sort_slice(&mut chunk, &self.sort_specs, &self.schema);
+            Self::sort_slice(&mut chunk, &self.sort_key_indices);
             self.in_memory_rows = chunk;
         } else {
             // Flush the tail chunk as the last run (if non-empty)
             if !chunk.is_empty() {
-                Self::sort_slice(&mut chunk, &self.sort_specs, &self.schema);
+                Self::sort_slice(&mut chunk, &self.sort_key_indices);
                 let (start, n) = self.write_run(&chunk)?;
                 runs.push(vec![(start, n)]);
             }
@@ -1499,24 +1496,25 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
         (budget / self.right_row_size()).max(1)
     }
 
-    fn extract_left_key(&self, row: &Row) -> Vec<Data> {
-        self.left_key_idx.iter()
-            .map(|&i| row.get(i).cloned().unwrap_or(Data::Int32(0)))
-            .collect()
-    }
-
-    fn extract_right_key(&self, row: &Row) -> Vec<Data> {
-        self.right_key_idx.iter()
-            .map(|&i| row.get(i).cloned().unwrap_or(Data::Int32(0)))
-            .collect()
-    }
-
-    fn compare_keys(a: &[Data], b: &[Data]) -> std::cmp::Ordering {
-        for (av, bv) in a.iter().zip(b.iter()) {
-            let ord = av.partial_cmp(bv).unwrap_or(std::cmp::Ordering::Equal);
+    /// Compare join-key columns between two rows without allocating.
+    fn compare_rows(row_l: &Row, idx_l: &[usize], row_r: &Row, idx_r: &[usize]) -> std::cmp::Ordering {
+        for (&il, &ir) in idx_l.iter().zip(idx_r.iter()) {
+            let vl = row_l.get(il).unwrap_or(&Data::Int32(0));
+            let vr = row_r.get(ir).unwrap_or(&Data::Int32(0));
+            let ord = vl.partial_cmp(vr).unwrap_or(std::cmp::Ordering::Equal);
             if ord != std::cmp::Ordering::Equal { return ord; }
         }
         std::cmp::Ordering::Equal
+    }
+
+    /// True when `row`'s right key columns all equal the pre-extracted `key` slice.
+    fn row_matches_right_key(row: &Row, right_key_idx: &[usize], key: &[Data]) -> bool {
+        right_key_idx.iter().zip(key.iter()).all(|(&idx, kv)| {
+            row.get(idx)
+                .and_then(|v| v.partial_cmp(kv))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                == std::cmp::Ordering::Equal
+        })
     }
 
     // ------------------------------------------------------------------
@@ -1537,7 +1535,9 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
             }
         }
 
-        let key      = self.extract_right_key(&first_row);
+        let key: Vec<Data> = self.right_key_idx.iter()
+            .map(|&i| first_row.get(i).cloned().unwrap_or(Data::Int32(0)))
+            .collect();
         let max_rows = self.max_right_group_rows();
 
         self.right_group_ram.clear();
@@ -1555,8 +1555,7 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
             match self.right.next()? {
                 None => { self.right_peek = None; return Ok(()); }
                 Some(row) => {
-                    let rk = self.extract_right_key(&row);
-                    if Self::compare_keys(&rk, &key) != std::cmp::Ordering::Equal {
+                    if !Self::row_matches_right_key(&row, &self.right_key_idx, &key) {
                         self.right_peek = Some(row);
                         return Ok(());
                     }
@@ -1612,8 +1611,7 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
             match self.right.next()? {
                 None => { self.right_peek = None; break; }
                 Some(row) => {
-                    let rk = self.extract_right_key(&row);
-                    if Self::compare_keys(&rk, &key) != std::cmp::Ordering::Equal {
+                    if !Self::row_matches_right_key(&row, &self.right_key_idx, &key) {
                         self.right_peek = Some(row); break;
                     }
                     let enc = encode_row(&row, &self.right_cols)?;
@@ -1690,33 +1688,30 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
     /// start of an unprocessed group.
     fn advance_to_next_match(&mut self) -> Result<()> {
         loop {
-            let lk = match self.cur_left.as_ref() {
-                None    => { self.done = true; return Ok(()); }
-                Some(r) => self.extract_left_key(r),
-            };
-            let rk = match self.right_peek.as_ref() {
-                None    => { self.done = true; return Ok(()); }
-                Some(r) => self.extract_right_key(r),
-            };
-
-            match Self::compare_keys(&lk, &rk) {
+            if self.cur_left.is_none() || self.right_peek.is_none() {
+                self.done = true;
+                return Ok(());
+            }
+            let left_row  = self.cur_left.as_ref().unwrap();
+            let right_row = self.right_peek.as_ref().unwrap();
+            match Self::compare_rows(left_row, &self.left_key_idx, right_row, &self.right_key_idx) {
                 std::cmp::Ordering::Equal => {
                     let first = self.right_peek.take().unwrap();
                     self.load_right_group(first)?;
                     return Ok(());
                 }
                 std::cmp::Ordering::Less => {
-                    // Left is behind — advance left one row
                     self.cur_left = self.left.next()?;
                 }
                 std::cmp::Ordering::Greater => {
-                    // Right is behind — drain right_peek's entire key group
-                    let skip_key = self.extract_right_key(self.right_peek.as_ref().unwrap());
+                    // Drain right_peek's entire key group without allocating.
+                    let skip_row = self.right_peek.take().unwrap();
                     loop {
                         match self.right.next()? {
                             None => { self.right_peek = None; break; }
                             Some(row) => {
-                                if Self::compare_keys(&self.extract_right_key(&row), &skip_key)
+                                if Self::compare_rows(&skip_row, &self.right_key_idx,
+                                                      &row,      &self.right_key_idx)
                                     != std::cmp::Ordering::Equal
                                 {
                                     self.right_peek = Some(row);
@@ -1760,17 +1755,17 @@ impl<R: Read, W: Write> Operator for SortMergeJoinOperator<R, W> {
                 }
                 None => {
                     // Right group exhausted for current left row — advance left
-                    let cur_key = self.extract_left_key(self.cur_left.as_ref().unwrap());
+                    let prev_left = self.cur_left.take().unwrap();
                     self.cur_left = self.left.next()?;
                     match self.cur_left.as_ref() {
                         None => { self.done = true; return Ok(None); }
                         Some(next) => {
-                            let next_key = self.extract_left_key(next);
-                            if Self::compare_keys(&next_key, &cur_key) == std::cmp::Ordering::Equal {
-                                // Same key — replay the right group
+                            if Self::compare_rows(&prev_left, &self.left_key_idx,
+                                                  next,       &self.left_key_idx)
+                                == std::cmp::Ordering::Equal
+                            {
                                 self.reset_right_group();
                             } else {
-                                // New key — scan forward for next match
                                 self.advance_to_next_match()?;
                                 if self.done { return Ok(None); }
                             }
