@@ -33,6 +33,87 @@ impl Hasher for FnvHasher {
 }
 
 type FnvHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FnvHasher>>;
+
+// ---------------------------------------------------------------------------
+// BloomFilter — used for sideways pushdown in HashJoinOperator.
+//
+// Built from build-side (left) join-key hashes during the left spill, then
+// queried per probe-side (right) row during the right spill so rows whose
+// key cannot possibly match any left key are dropped before encode/write.
+// Saves both writes (in this phase) and reads (in the probe phase) for any
+// selective join.
+//
+// Design:
+//  - Fixed-size bit array, capped in bytes — memory is bounded regardless
+//    of dataset cardinality. Falsely-positive lookups only cost a wasted
+//    spill+probe; never miss a true match.
+//  - Double-hashing trick: derive k bit positions from a single 64-bit key
+//    hash via h_i = h1 + i*h2, where h1 = key_hash and h2 = mix(key_hash).
+//    Avoids the cost of running the row through k independent hashers.
+//  - Word-granular bit array (Vec<u64>) for cache-friendly access.
+// ---------------------------------------------------------------------------
+struct BloomFilter {
+    bits: Vec<u64>,
+    num_bits: u64,
+    num_hashes: u32,
+}
+
+impl BloomFilter {
+    /// Allocate a filter sized to roughly `bits_per_element` bits per expected
+    /// key, capped at `max_bytes`. `expected_elements` may be a rough estimate;
+    /// past saturation the filter just degrades (higher FPR), still correct.
+    fn new(expected_elements: usize, max_bytes: usize) -> Self {
+        const BITS_PER_ELEMENT: usize = 10;
+        let target_bits = expected_elements.saturating_mul(BITS_PER_ELEMENT).max(64);
+        let cap_bits = max_bytes.saturating_mul(8).max(64);
+        let mut num_bits = target_bits.min(cap_bits);
+        // Round up to a multiple of 64 so we can index by whole words.
+        num_bits = num_bits.div_ceil(64) * 64;
+        let words = num_bits / 64;
+        Self {
+            bits: vec![0u64; words],
+            num_bits: num_bits as u64,
+            num_hashes: 7,
+        }
+    }
+
+    #[inline(always)]
+    fn positions(&self, key_hash: u64) -> (u64, u64) {
+        // h1 from the raw key hash; h2 from a cheap independent mix so the
+        // (h1, h2) probes don't stay correlated to the partition function
+        // (which uses key_hash % partition_count, the lowest bits).
+        let h1 = key_hash;
+        let h2 = key_hash.rotate_left(32) ^ 0x9E37_79B9_7F4A_7C15u64;
+        // Ensure h2 is odd so successive probes stay distinct mod even widths.
+        let h2 = h2 | 1;
+        (h1, h2)
+    }
+
+    fn insert(&mut self, key_hash: u64) {
+        let (h1, h2) = self.positions(key_hash);
+        let m = self.num_bits;
+        for i in 0..self.num_hashes as u64 {
+            let bit = h1.wrapping_add(i.wrapping_mul(h2)) % m;
+            let word = (bit >> 6) as usize;
+            let mask = 1u64 << (bit & 63);
+            self.bits[word] |= mask;
+        }
+    }
+
+    fn might_contain(&self, key_hash: u64) -> bool {
+        let (h1, h2) = self.positions(key_hash);
+        let m = self.num_bits;
+        for i in 0..self.num_hashes as u64 {
+            let bit = h1.wrapping_add(i.wrapping_mul(h2)) % m;
+            let word = (bit >> 6) as usize;
+            let mask = 1u64 << (bit & 63);
+            if (self.bits[word] & mask) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use anyhow::{Result, anyhow};
@@ -917,6 +998,11 @@ pub struct HashJoinOperator<R: Read, W: Write> {
     /// left counterpart — eliminates wasted writes (and the corresponding
     /// future reads / cylinder seeks) for non-matching partitions.
     non_empty_left: Vec<bool>,
+    /// Built during left-spill, queried during right-spill: a Bloom filter
+    /// over left join-key hashes. A right row whose key isn't in the filter
+    /// can never join, so we skip its encode + write entirely. Finer-grained
+    /// than `non_empty_left` (per-row vs per-partition).
+    left_bloom: Option<BloomFilter>,
     current_right_reader: Option<SegmentedRunReader<R, W>>,
     current_right_extents: Vec<(u64, u64)>,
     current_right_row: Option<Row>,
@@ -998,6 +1084,7 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
             probe_partition_idx: 0,
             left_hash: FnvHashMap::default(),
             non_empty_left: vec![false; partition_count],
+            left_bloom: None,
             current_right_reader: None,
             current_right_extents: Vec::new(),
             current_right_row: None,
@@ -1012,7 +1099,10 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
             .collect()
     }
 
-    fn partition_for_row(row: &Row, key_indices: &[usize], partition_count: usize) -> usize {
+    /// Single FNV-1a hash of the row's join-key fields. Reused for both
+    /// partition selection and Bloom filter probing — one hash, two uses.
+    #[inline]
+    fn key_hash_64(row: &Row, key_indices: &[usize]) -> u64 {
         let mut hasher = FnvHasher::new();
         for &idx in key_indices {
             if let Some(v) = row.get(idx) {
@@ -1021,7 +1111,12 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
                 Data::Int32(0).hash(&mut hasher);
             }
         }
-        (hasher.finish() as usize) % partition_count
+        hasher.finish()
+    }
+
+    #[inline]
+    fn partition_for_row(row: &Row, key_indices: &[usize], partition_count: usize) -> usize {
+        (Self::key_hash_64(row, key_indices) as usize) % partition_count
     }
 
     fn append_encoded_row(
@@ -1119,13 +1214,25 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
         // Used on the build (left) side to record which partitions are
         // non-empty for the subsequent probe-side spill.
         record_non_empty: Option<&mut [bool]>,
+        // If Some(bloom), each spilled row's key hash is inserted. Build side.
+        bloom_insert: Option<&mut BloomFilter>,
+        // If Some(bloom), rows whose key hash is not in the filter are dropped.
+        // Probe side. Operates per-row (finer than `keep_partition`).
+        bloom_check: Option<&BloomFilter>,
     ) -> Result<()> {
         let mut record = record_non_empty;
+        let mut insert = bloom_insert;
         while let Some(row) = child.next()? {
-            let partition_idx = Self::partition_for_row(&row, key_indices, partition_count);
+            let key_hash = Self::key_hash_64(&row, key_indices);
+            let partition_idx = (key_hash as usize) % partition_count;
 
             if let Some(mask) = keep_partition {
                 if !mask[partition_idx] {
+                    continue;
+                }
+            }
+            if let Some(bf) = bloom_check {
+                if !bf.might_contain(key_hash) {
                     continue;
                 }
             }
@@ -1142,6 +1249,9 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
             Self::append_encoded_row(block_size, disk_access, anon_allocator, &mut partitions[partition_idx], &encoded)?;
             if let Some(m) = record.as_deref_mut() {
                 m[partition_idx] = true;
+            }
+            if let Some(bf) = insert.as_deref_mut() {
+                bf.insert(key_hash);
             }
         }
 
@@ -1227,6 +1337,15 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
         let left_key_idx = self.left_key_idx.clone();
         let right_key_idx = self.right_key_idx.clone();
 
+        // Allocate the Bloom filter up-front. Cap at 1 MB regardless of build
+        // size so memory stays bounded; past saturation FPR rises gracefully
+        // (filter becomes less selective, never produces false negatives).
+        // The expected-element estimate is just a hint to right-size below the
+        // cap when the build is small.
+        const BLOOM_MAX_BYTES: usize = 1 << 20;     // 1 MB
+        const BLOOM_EXPECTED_HINT: usize = 1 << 17; // 128 K elements; bumped to cap if more arrive
+        self.left_bloom = Some(BloomFilter::new(BLOOM_EXPECTED_HINT, BLOOM_MAX_BYTES));
+
         Self::spill_side(
             block_size,
             partition_count,
@@ -1238,6 +1357,8 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
             &left_key_idx,
             None,
             Some(&mut self.non_empty_left),
+            self.left_bloom.as_mut(),
+            None,
         )?;
         // Drop the build-side iterator BEFORE consuming the probe side so any
         // resources it holds (open files, prefetch buffers) are released.
@@ -1253,7 +1374,12 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
             &right_key_idx,
             Some(&self.non_empty_left),
             None,
+            None,
+            self.left_bloom.as_ref(),
         )?;
+        // Build-side hash table is built fresh per partition during probe;
+        // the Bloom filter is no longer needed and can be freed now.
+        self.left_bloom = None;
 
        for p in &mut self.left_partitions {
             p.block = Vec::new();
