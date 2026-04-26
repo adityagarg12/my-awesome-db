@@ -56,6 +56,8 @@ pub struct CrossData {
 pub enum JoinAlgorithm {
     /// Sort-Merge Join — both inputs must arrive pre-sorted on the join key.
     SortMerge,
+    /// Grace Hash Join — hash partition both inputs, then probe partition pairs.
+    HashJoin,
 }
 
 /// Optimizer-internal node: never appears in the input query tree.
@@ -90,7 +92,7 @@ pub enum QueryOp {
     Cross(CrossData),
     Sort(SortData),
     Scan(ScanData),
-    /// Optimizer-internal: sort-merge join with pushed-down predicates.
+    /// Optimizer-internal join with pushed-down predicates.
     /// Never present in the input query; produced by the optimizer.
     Join(JoinData),
 }

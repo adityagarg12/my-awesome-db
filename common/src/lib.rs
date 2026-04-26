@@ -1,3 +1,4 @@
+use std::hash::{Hash, Hasher};
 use serde::{Deserialize, Serialize};
 
 pub mod query;
@@ -42,6 +43,35 @@ impl PartialEq for Data {
             (Self::Float64(l0), Self::Float64(r0)) => l0 == r0,
             (Self::String(l0), Self::String(r0)) => l0 == r0,
             _ => false,
+        }
+    }
+}
+
+impl Eq for Data {}
+
+impl Hash for Data {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Int32(v) => {
+                0u8.hash(state);
+                v.hash(state);
+            }
+            Self::Int64(v) => {
+                1u8.hash(state);
+                v.hash(state);
+            }
+            Self::Float32(v) => {
+                2u8.hash(state);
+                v.to_bits().hash(state);
+            }
+            Self::Float64(v) => {
+                3u8.hash(state);
+                v.to_bits().hash(state);
+            }
+            Self::String(v) => {
+                4u8.hash(state);
+                v.hash(state);
+            }
         }
     }
 }

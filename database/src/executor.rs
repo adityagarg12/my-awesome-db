@@ -1,4 +1,6 @@
 use std::collections::{BinaryHeap, HashMap};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use anyhow::{Result, anyhow};
@@ -104,6 +106,10 @@ const BATCH_BLOCKS: usize = 256;
 //   fan_in = available / per_run  →  fan_in × per_run ≈ constant.
 // Must stay in sync with PREFETCH_BLOCKS_PER_SCAN in main.rs (same buffer pool).
 const RUN_PREFETCH_SIZE: u64 = 32;
+
+// Grace hash join parameters.
+const HASH_PARTITIONS: usize = 32;
+const HASH_PARTITION_BATCH_BLOCKS: usize = 16;
 
 /// Encoded byte length of one row without allocating any buffer.
 /// Must stay in sync with encode_row / encode_value in row.rs.
@@ -812,6 +818,431 @@ impl<R: Read, W: Write> Drop for CrossOperator<R, W> {
             self.anon_allocator.free(start, count);
         }
         self.right_num_blocks = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HashJoinOperator  — Grace Hash Join for equi-joins
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct PartitionBuffer {
+    extents: Vec<(u64, u64)>,
+    block: Vec<u8>,
+    block_off: usize,
+    rows_in_block: u16,
+    pending: Vec<u8>,
+    pending_blocks: usize,
+}
+
+impl PartitionBuffer {
+    fn new(block_size: usize) -> Self {
+        Self {
+            extents: Vec::new(),
+            block: vec![0u8; block_size],
+            block_off: 0,
+            rows_in_block: 0,
+            pending: vec![0u8; HASH_PARTITION_BATCH_BLOCKS * block_size],
+            pending_blocks: 0,
+        }
+    }
+}
+
+pub struct HashJoinOperator<R: Read, W: Write> {
+    left: Option<Box<dyn Operator>>,
+    right: Option<Box<dyn Operator>>,
+    schema: Schema,
+    left_cols: Vec<ColumnCatalog>,
+    right_cols: Vec<ColumnCatalog>,
+    left_key_idx: Vec<usize>,
+    right_key_idx: Vec<usize>,
+    memory_limit_bytes: u64,
+    disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
+    block_size: u64,
+    anon_allocator: AnonBlockAllocator,
+    partition_count: usize,
+
+    initialized: bool,
+    done: bool,
+    left_partitions: Vec<PartitionBuffer>,
+    right_partitions: Vec<PartitionBuffer>,
+
+    probe_partition_idx: usize,
+    left_hash: HashMap<Vec<Data>, Vec<Row>>,
+    current_right_reader: Option<SegmentedRunReader<R, W>>,
+    current_right_extents: Vec<(u64, u64)>,
+    current_right_row: Option<Row>,
+    current_left_matches: Vec<Row>,
+    current_left_match_idx: usize,
+}
+
+impl<R: Read, W: Write> HashJoinOperator<R, W> {
+    pub fn new(
+        left: Box<dyn Operator>,
+        right: Box<dyn Operator>,
+        disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
+        block_size: u64,
+        memory_limit_bytes: u64,
+        anon_allocator: AnonBlockAllocator,
+        predicates: Vec<Predicate>,
+    ) -> Result<Self> {
+        let schema = Schema::merge(left.schema(), right.schema());
+        let left_cols = left.schema().columns().to_vec();
+        let right_cols = right.schema().columns().to_vec();
+
+        let mut left_key_idx = Vec::new();
+        let mut right_key_idx = Vec::new();
+
+        for pred in &predicates {
+            if !matches!(pred.operator, ComparisionOperator::EQ) {
+                continue;
+            }
+            let other_col = match &pred.value {
+                ComparisionValue::Column(c) => c,
+                _ => continue,
+            };
+
+            let lk = left.schema().get_index(&pred.column_name);
+            let rk = right.schema().get_index(other_col);
+            if let (Some(li), Some(ri)) = (lk, rk) {
+                left_key_idx.push(li);
+                right_key_idx.push(ri);
+                continue;
+            }
+
+            let lk = left.schema().get_index(other_col);
+            let rk = right.schema().get_index(&pred.column_name);
+            if let (Some(li), Some(ri)) = (lk, rk) {
+                left_key_idx.push(li);
+                right_key_idx.push(ri);
+            }
+        }
+
+        if left_key_idx.is_empty() {
+            anyhow::bail!("HashJoin: no equi-join predicates found");
+        }
+
+        let partition_count = HASH_PARTITIONS;
+        let left_partitions = (0..partition_count)
+            .map(|_| PartitionBuffer::new(block_size as usize))
+            .collect();
+        let right_partitions = (0..partition_count)
+            .map(|_| PartitionBuffer::new(block_size as usize))
+            .collect();
+
+        Ok(Self {
+            left: Some(left),
+            right: Some(right),
+            schema,
+            left_cols,
+            right_cols,
+            left_key_idx,
+            right_key_idx,
+            memory_limit_bytes,
+            disk_access,
+            block_size,
+            anon_allocator,
+            partition_count,
+            initialized: false,
+            done: false,
+            left_partitions,
+            right_partitions,
+            probe_partition_idx: 0,
+            left_hash: HashMap::new(),
+            current_right_reader: None,
+            current_right_extents: Vec::new(),
+            current_right_row: None,
+            current_left_matches: Vec::new(),
+            current_left_match_idx: 0,
+        })
+    }
+
+    fn row_key(row: &Row, key_indices: &[usize]) -> Vec<Data> {
+        key_indices.iter()
+            .map(|&idx| row.get(idx).cloned().unwrap_or(Data::Int32(0)))
+            .collect()
+    }
+
+    fn partition_for_row(row: &Row, key_indices: &[usize], partition_count: usize) -> usize {
+        let mut hasher = DefaultHasher::new();
+        for &idx in key_indices {
+            row.get(idx).cloned().unwrap_or(Data::Int32(0)).hash(&mut hasher);
+        }
+        (hasher.finish() as usize) % partition_count
+    }
+
+    fn append_encoded_row(
+        block_size: u64,
+        disk_access: &Arc<Mutex<DiskAccessLayer<R, W>>>,
+        anon_allocator: &AnonBlockAllocator,
+        partition: &mut PartitionBuffer,
+        encoded: &[u8],
+    ) -> Result<()> {
+        let usable = block_size as usize - 2;
+        if partition.block_off + encoded.len() > usable {
+            Self::flush_partition_block(block_size, disk_access, anon_allocator, partition)?;
+        }
+
+        partition.block[partition.block_off..partition.block_off + encoded.len()]
+            .copy_from_slice(encoded);
+        partition.block_off += encoded.len();
+        partition.rows_in_block += 1;
+        Ok(())
+    }
+
+    fn flush_partition_block(
+        block_size: u64,
+        disk_access: &Arc<Mutex<DiskAccessLayer<R, W>>>,
+        anon_allocator: &AnonBlockAllocator,
+        partition: &mut PartitionBuffer,
+    ) -> Result<()> {
+        if partition.rows_in_block == 0 {
+            return Ok(());
+        }
+
+        let bs = block_size as usize;
+        let footer = partition.block.len() - 2;
+        partition.block[footer..].copy_from_slice(&partition.rows_in_block.to_le_bytes());
+
+        let offset = partition.pending_blocks * bs;
+        partition.pending[offset..offset + bs].copy_from_slice(&partition.block);
+        partition.block.fill(0);
+        partition.block_off = 0;
+        partition.rows_in_block = 0;
+        partition.pending_blocks += 1;
+
+        if partition.pending_blocks == HASH_PARTITION_BATCH_BLOCKS {
+            let n = partition.pending_blocks as u64;
+            let start = anon_allocator.allocate_sequential(n);
+            push_extent(&mut partition.extents, start, n);
+            disk_access.lock().unwrap().write_blocks(start, n, &partition.pending[..n as usize * bs])?;
+            partition.pending_blocks = 0;
+        }
+
+        Ok(())
+    }
+
+    fn flush_partition_pending(
+        block_size: u64,
+        disk_access: &Arc<Mutex<DiskAccessLayer<R, W>>>,
+        anon_allocator: &AnonBlockAllocator,
+        partition: &mut PartitionBuffer,
+    ) -> Result<()> {
+        if partition.pending_blocks == 0 {
+            return Ok(());
+        }
+
+        let bs = block_size as usize;
+        let n = partition.pending_blocks as u64;
+        let start = anon_allocator.allocate_sequential(n);
+        push_extent(&mut partition.extents, start, n);
+        disk_access.lock().unwrap().write_blocks(start, n, &partition.pending[..n as usize * bs])?;
+        partition.pending_blocks = 0;
+        Ok(())
+    }
+
+    fn spill_side(
+        block_size: u64,
+        partition_count: usize,
+        disk_access: &Arc<Mutex<DiskAccessLayer<R, W>>>,
+        anon_allocator: &AnonBlockAllocator,
+        child: &mut Box<dyn Operator>,
+        partitions: &mut [PartitionBuffer],
+        cols: &[ColumnCatalog],
+        key_indices: &[usize],
+    ) -> Result<()> {
+        while let Some(row) = child.next()? {
+            let encoded = encode_row(&row, cols)?;
+            if encoded.len() > block_size as usize - 2 {
+                anyhow::bail!(
+                    "HashJoin: row ({} B) exceeds usable block space ({} B)",
+                    encoded.len(),
+                    block_size as usize - 2,
+                );
+            }
+
+            let partition_idx = Self::partition_for_row(&row, key_indices, partition_count);
+            Self::append_encoded_row(block_size, disk_access, anon_allocator, &mut partitions[partition_idx], &encoded)?;
+        }
+
+        for partition in partitions.iter_mut() {
+            Self::flush_partition_block(block_size, disk_access, anon_allocator, partition)?;
+            Self::flush_partition_pending(block_size, disk_access, anon_allocator, partition)?;
+        }
+        Ok(())
+    }
+
+    fn free_extents(anon_allocator: &AnonBlockAllocator, extents: Vec<(u64, u64)>) {
+        for (start, count) in extents {
+            anon_allocator.free(start, count);
+        }
+    }
+
+    fn load_next_partition(&mut self) -> Result<bool> {
+        self.left_hash.clear();
+        self.current_right_row = None;
+        self.current_left_matches.clear();
+        self.current_left_match_idx = 0;
+
+        while self.probe_partition_idx < self.partition_count {
+            let idx = self.probe_partition_idx;
+            let left_extents = std::mem::take(&mut self.left_partitions[idx].extents);
+            let right_extents = std::mem::take(&mut self.right_partitions[idx].extents);
+
+            if left_extents.is_empty() || right_extents.is_empty() {
+                Self::free_extents(&self.anon_allocator, left_extents);
+                Self::free_extents(&self.anon_allocator, right_extents);
+                self.probe_partition_idx += 1;
+                continue;
+            }
+
+            let mut left_reader = SegmentedRunReader::new(
+                self.disk_access.clone(),
+                self.left_cols.clone(),
+                self.block_size,
+                left_extents.clone(),
+            );
+
+            while let Some(row) = left_reader.next_row()? {
+                let key = Self::row_key(&row, &self.left_key_idx);
+                self.left_hash.entry(key).or_default().push(row);
+            }
+
+            Self::free_extents(&self.anon_allocator, left_extents);
+
+            if self.left_hash.is_empty() {
+                Self::free_extents(&self.anon_allocator, right_extents);
+                self.probe_partition_idx += 1;
+                continue;
+            }
+
+            self.current_right_extents = right_extents;
+            self.current_right_reader = Some(SegmentedRunReader::new(
+                self.disk_access.clone(),
+                self.right_cols.clone(),
+                self.block_size,
+                self.current_right_extents.clone(),
+            ));
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    fn release_current_right_partition(&mut self) {
+        let extents = std::mem::take(&mut self.current_right_extents);
+        Self::free_extents(&self.anon_allocator, extents);
+    }
+
+    fn initialize(&mut self) -> Result<()> {
+        let mut left = self.left.take().unwrap();
+        let mut right = self.right.take().unwrap();
+
+        let disk_access = self.disk_access.clone();
+        let anon_allocator = self.anon_allocator.clone();
+        let block_size = self.block_size;
+        let partition_count = self.partition_count;
+        let left_cols = self.left_cols.clone();
+        let right_cols = self.right_cols.clone();
+        let left_key_idx = self.left_key_idx.clone();
+        let right_key_idx = self.right_key_idx.clone();
+
+        Self::spill_side(
+            block_size,
+            partition_count,
+            &disk_access,
+            &anon_allocator,
+            &mut left,
+            &mut self.left_partitions,
+            &left_cols,
+            &left_key_idx,
+        )?;
+        Self::spill_side(
+            block_size,
+            partition_count,
+            &disk_access,
+            &anon_allocator,
+            &mut right,
+            &mut self.right_partitions,
+            &right_cols,
+            &right_key_idx,
+        )?;
+
+        self.initialized = true;
+        Ok(())
+    }
+}
+
+impl<R: Read, W: Write> Operator for HashJoinOperator<R, W> {
+    fn schema(&self) -> &Schema { &self.schema }
+
+    fn next(&mut self) -> Result<Option<Row>> {
+        if !self.initialized {
+            self.initialize()?;
+        }
+
+        if self.done {
+            return Ok(None);
+        }
+
+        loop {
+            if let Some(right_row) = self.current_right_row.as_ref() {
+                if self.current_left_match_idx < self.current_left_matches.len() {
+                    let left_row = &self.current_left_matches[self.current_left_match_idx];
+                    self.current_left_match_idx += 1;
+                    let mut values = left_row.values().to_vec();
+                    values.extend_from_slice(right_row.values());
+                    return Ok(Some(Row::new(values)));
+                }
+
+                self.current_right_row = None;
+                self.current_left_matches.clear();
+                self.current_left_match_idx = 0;
+                continue;
+            }
+
+            if self.current_right_reader.is_none() {
+                if !self.load_next_partition()? {
+                    self.done = true;
+                    return Ok(None);
+                }
+                continue;
+            }
+
+            match self.current_right_reader.as_mut().unwrap().next_row()? {
+                Some(right_row) => {
+                    let key = Self::row_key(&right_row, &self.right_key_idx);
+                    if let Some(left_rows) = self.left_hash.get(&key) {
+                        self.current_right_row = Some(right_row);
+                        self.current_left_matches = left_rows.clone();
+                        self.current_left_match_idx = 0;
+                    }
+                }
+                None => {
+                    self.current_right_reader = None;
+                    self.release_current_right_partition();
+                    self.probe_partition_idx += 1;
+                }
+            }
+        }
+    }
+}
+
+impl<R: Read, W: Write> Drop for HashJoinOperator<R, W> {
+    fn drop(&mut self) {
+        for partition in &mut self.left_partitions {
+            for (start, count) in partition.extents.drain(..) {
+                self.anon_allocator.free(start, count);
+            }
+        }
+        for partition in &mut self.right_partitions {
+            for (start, count) in partition.extents.drain(..) {
+                self.anon_allocator.free(start, count);
+            }
+        }
+        for (start, count) in self.current_right_extents.drain(..) {
+            self.anon_allocator.free(start, count);
+        }
     }
 }
 
@@ -2015,6 +2446,8 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
             match d.algorithm {
                 JoinAlgorithm::SortMerge =>
                     Ok(Box::new(SortMergeJoinOperator::new(left, right, disk_access, block_size, 10 * memory_limit_bytes, anon_allocator.clone(), d.predicates.clone())?)),
+                JoinAlgorithm::HashJoin =>
+                    Ok(Box::new(HashJoinOperator::new(left, right, disk_access, block_size, 10 * memory_limit_bytes, anon_allocator.clone(), d.predicates.clone())?)),
             }
         }
     }

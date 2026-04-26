@@ -308,7 +308,7 @@ fn build_join_tree(inputs: Vec<QueryOp>, predicates: Vec<Predicate>, catalog: &C
                 left:       Box::new(current),
                 right:      Box::new(next),
                 predicates: applicable_eq,
-                algorithm:  JoinAlgorithm::SortMerge,
+                algorithm:  JoinAlgorithm::HashJoin,
             })
         };
 
@@ -446,23 +446,7 @@ fn select_join_algorithm(op: QueryOp, catalog: &Catalog) -> QueryOp {
         });
     }
 
-    let left_specs  = make_sort_specs(&left_key);
-    let right_specs = make_sort_specs(&right_key);
-
-    if !is_sorted_on(&d.left, &left_specs) {
-        d.left = Box::new(QueryOp::Sort(SortData {
-            underlying: d.left,
-            sort_specs: left_specs,
-        }));
-    }
-    if !is_sorted_on(&d.right, &right_specs) {
-        d.right = Box::new(QueryOp::Sort(SortData {
-            underlying: d.right,
-            sort_specs: right_specs,
-        }));
-    }
-
-    d.algorithm = JoinAlgorithm::SortMerge;
+    d.algorithm = JoinAlgorithm::HashJoin;
     d.predicates = smj_preds; 
 
     let join_op = QueryOp::Join(d);
