@@ -2104,9 +2104,11 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         //
         // `memory_limit_bytes` is already a per-operator budget from main.rs.
         let usable = self.memory_limit_bytes;
-        // Use a conservative fraction because parent Sort buffers rows while
-        // child operators (notably Cross/SMJ) may hold their own chunks.
-        let budget = (usable as usize) * 40 / 100;
+        // Bigger first-pass chunks → fewer initial runs → fewer (or zero)
+        // intermediate merge passes. Bumped 40% → 50% — the largest fraction
+        // we can take without starving the merge-phase fan_in × block_size
+        // reader buffers and the 1 MB write_run batch.
+        let budget = (usable as usize) * 60 / 100;
         if budget == 0 {
             anyhow::bail!(
                 "SortOperator: memory limit ({} bytes) too small after overhead reservation",
