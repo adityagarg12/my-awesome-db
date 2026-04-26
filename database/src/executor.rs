@@ -1008,6 +1008,11 @@ pub struct HashJoinOperator<R: Read, W: Write> {
     current_right_row: Option<Row>,
     current_left_matches: Vec<Row>,
     current_left_match_idx: usize,
+    /// Hybrid-HJ flag: when true, the build (left) side fully fit in RAM, so
+    /// we skipped all left/right partition spills. `left_hash` holds the full
+    /// build, `right` (still in `self.right`) is streamed directly during probe.
+    /// When false, we are in classic grace mode (partitioned spill on disk).
+    inmem_mode: bool,
 }
 
 impl<R: Read, W: Write> HashJoinOperator<R, W> {
@@ -1090,6 +1095,7 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
             current_right_row: None,
             current_left_matches: Vec::new(),
             current_left_match_idx: 0,
+            inmem_mode: false,
         })
     }
 
@@ -1324,6 +1330,56 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
         Self::free_extents(&self.anon_allocator, extents);
     }
 
+    /// Conservative byte-cost estimate for one row sitting in the build hash
+    /// table. Includes the stored Row, the duplicated key Vec<Data>, and the
+    /// HashMap entry overhead. Over-estimates rather than under, so the
+    /// in-memory budget guard never lets total RAM exceed `inmem_cap`.
+    fn approx_row_bytes(row: &Row) -> u64 {
+        // 64 B HashMap entry + 24 B Row header + 24 B value Vec header
+        let mut b: u64 = 112;
+        for v in row.values() {
+            b += 24; // Data enum slot
+            if let Data::String(s) = v {
+                b += 24 + s.len() as u64; // String header + content
+            }
+        }
+        // Key Vec<Data> mirror — 24 B header + per-key-col 24 B (+ string tail).
+        // We don't have key_indices here; assume up to 4 key cols at 24 B each,
+        // which over-estimates for typical 1-2 col equi-joins.
+        b + 24 + 24 * 4
+    }
+
+    /// Spill one already-materialised row into a partition buffer (used by the
+    /// hybrid fallback when re-routing rows that were buffered in `left_hash`).
+    fn spill_one_row(
+        block_size: u64,
+        disk_access: &Arc<Mutex<DiskAccessLayer<R, W>>>,
+        anon_allocator: &AnonBlockAllocator,
+        partitions: &mut [PartitionBuffer],
+        cols: &[ColumnCatalog],
+        key_indices: &[usize],
+        non_empty: &mut [bool],
+        bloom: &mut BloomFilter,
+        partition_count: usize,
+        row: Row,
+    ) -> Result<()> {
+        let key_hash = Self::key_hash_64(&row, key_indices);
+        let pidx = (key_hash as usize) % partition_count;
+        let encoded = encode_row(&row, cols)?;
+        if encoded.len() > block_size as usize - 2 {
+            anyhow::bail!(
+                "HashJoin: row ({} B) exceeds usable block space ({} B)",
+                encoded.len(),
+                block_size as usize - 2,
+            );
+        }
+        Self::append_encoded_row(block_size, disk_access, anon_allocator,
+            &mut partitions[pidx], &encoded)?;
+        non_empty[pidx] = true;
+        bloom.insert(key_hash);
+        Ok(())
+    }
+
     fn initialize(&mut self) -> Result<()> {
         let mut left = self.left.take().unwrap();
         let mut right = self.right.take().unwrap();
@@ -1337,15 +1393,81 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
         let left_key_idx = self.left_key_idx.clone();
         let right_key_idx = self.right_key_idx.clone();
 
-        // Allocate the Bloom filter up-front. Cap at 1 MB regardless of build
-        // size so memory stays bounded; past saturation FPR rises gracefully
-        // (filter becomes less selective, never produces false negatives).
-        // The expected-element estimate is just a hint to right-size below the
-        // cap when the build is small.
+        // ------------------------------------------------------------------
+        // Phase 1 — try fully in-memory build (hybrid fast path).
+        //
+        // Use half of the operator's memory budget for the hash table; the
+        // other half is reserved so a fallback to grace mode (partition
+        // pending buffers + Bloom + per-row work) cannot OOM. If the build
+        // exceeds `inmem_cap` we abort the in-memory attempt cleanly and
+        // re-route everything we accumulated into the partitioned spill.
+        // ------------------------------------------------------------------
+        let inmem_cap = self.memory_limit_bytes / 2;
+        let mut inmem_bytes: u64 = 0;
+        let mut overflow_row: Option<Row> = None;
+
+        loop {
+            let row = match left.next()? {
+                Some(r) => r,
+                None    => break,
+            };
+            let row_bytes = Self::approx_row_bytes(&row);
+            if inmem_bytes.saturating_add(row_bytes) > inmem_cap {
+                // Don't insert this row — it triggered the overflow. Spill it
+                // along with everything already buffered in the fallback path.
+                overflow_row = Some(row);
+                break;
+            }
+            inmem_bytes += row_bytes;
+            let key = Self::row_key(&row, &left_key_idx);
+            self.left_hash.entry(key).or_default().push(row);
+        }
+
+        if overflow_row.is_none() {
+            // Build fits entirely in RAM. Skip ALL spilling on both sides:
+            // probe will stream the right child directly against `left_hash`.
+            self.inmem_mode = true;
+            self.right = Some(right);
+            self.initialized = true;
+            return Ok(());
+        }
+
+        // ------------------------------------------------------------------
+        // Phase 2 — fallback to grace hash join.
+        //
+        // Re-route every row currently buffered in `left_hash` into the
+        // partitioned spill, then the overflow row, then the rest of the
+        // left iterator. Build the Bloom filter as we go so the right-side
+        // spill (which follows) can drop non-matching probe rows up-front.
+        // ------------------------------------------------------------------
         const BLOOM_MAX_BYTES: usize = 1 << 20;     // 1 MB
-        const BLOOM_EXPECTED_HINT: usize = 1 << 17; // 128 K elements; bumped to cap if more arrive
+        const BLOOM_EXPECTED_HINT: usize = 1 << 17; // 128 K elements
         self.left_bloom = Some(BloomFilter::new(BLOOM_EXPECTED_HINT, BLOOM_MAX_BYTES));
 
+        // Drain the in-memory buffer into partitions. We move out of
+        // `self.left_hash` so its allocations get freed promptly.
+        let buffered = std::mem::take(&mut self.left_hash);
+        {
+            let bloom = self.left_bloom.as_mut().unwrap();
+            for (_, rows) in buffered {
+                for row in rows {
+                    Self::spill_one_row(
+                        block_size, &disk_access, &anon_allocator,
+                        &mut self.left_partitions, &left_cols, &left_key_idx,
+                        &mut self.non_empty_left, bloom, partition_count, row,
+                    )?;
+                }
+            }
+            // Spill the overflow row that triggered the transition.
+            Self::spill_one_row(
+                block_size, &disk_access, &anon_allocator,
+                &mut self.left_partitions, &left_cols, &left_key_idx,
+                &mut self.non_empty_left, bloom, partition_count,
+                overflow_row.unwrap(),
+            )?;
+        }
+
+        // Continue draining left into partitions via the standard spill loop.
         Self::spill_side(
             block_size,
             partition_count,
@@ -1360,9 +1482,8 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
             self.left_bloom.as_mut(),
             None,
         )?;
-        // Drop the build-side iterator BEFORE consuming the probe side so any
-        // resources it holds (open files, prefetch buffers) are released.
         drop(left);
+
         Self::spill_side(
             block_size,
             partition_count,
@@ -1377,11 +1498,11 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
             None,
             self.left_bloom.as_ref(),
         )?;
-        // Build-side hash table is built fresh per partition during probe;
-        // the Bloom filter is no longer needed and can be freed now.
+        // Bloom no longer needed past spill phase; build hash is rebuilt
+        // per-partition during probe.
         self.left_bloom = None;
 
-       for p in &mut self.left_partitions {
+        for p in &mut self.left_partitions {
             p.block = Vec::new();
             p.pending = Vec::new();
         }
@@ -1392,6 +1513,47 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
 
         self.initialized = true;
         Ok(())
+    }
+
+    fn next_inmem(&mut self) -> Result<Option<Row>> {
+        loop {
+            // Drain pending matches for the current right row first.
+            if let Some(right_row) = self.current_right_row.as_ref() {
+                if self.current_left_match_idx < self.current_left_matches.len() {
+                    let left_row = &self.current_left_matches[self.current_left_match_idx];
+                    self.current_left_match_idx += 1;
+                    let mut values = left_row.values().to_vec();
+                    values.extend_from_slice(right_row.values());
+                    return Ok(Some(Row::new(values)));
+                }
+                self.current_right_row = None;
+                self.current_left_matches.clear();
+                self.current_left_match_idx = 0;
+            }
+
+            // Pull next right row directly from the held child iterator.
+            let right = match self.right.as_mut() {
+                Some(r) => r,
+                None    => { self.done = true; return Ok(None); }
+            };
+            match right.next()? {
+                None => {
+                    self.done = true;
+                    self.right = None;
+                    self.left_hash.clear();
+                    return Ok(None);
+                }
+                Some(right_row) => {
+                    let key = Self::row_key(&right_row, &self.right_key_idx);
+                    if let Some(left_rows) = self.left_hash.get(&key) {
+                        self.current_right_row = Some(right_row);
+                        self.current_left_matches = left_rows.clone();
+                        self.current_left_match_idx = 0;
+                    }
+                    // else: no match, loop continues to next right row
+                }
+            }
+        }
     }
 }
 
@@ -1405,6 +1567,10 @@ impl<R: Read, W: Write> Operator for HashJoinOperator<R, W> {
 
         if self.done {
             return Ok(None);
+        }
+
+        if self.inmem_mode {
+            return self.next_inmem();
         }
 
         loop {
