@@ -44,7 +44,11 @@ fn db_main() -> Result<()> {
     let catalog = Catalog::from_db_context(&ctx)?;
 
     let (disk_in, disk_out) = setup_disk_io();
-    let (monitor_in, mut monitor_out) = setup_monitor_io();
+    let (monitor_in, monitor_out) = setup_monitor_io();
+    // Batch monitor writes to avoid one syscall per output row.
+    // The explicit flush() calls already present at "get_memory_limit" (line below)
+    // and at the end of the result-streaming loop ensure correct protocol ordering.
+    let mut monitor_out = std::io::BufWriter::with_capacity(64 * 1024, monitor_out);
 
     let disk_access = Arc::new(Mutex::new(DiskAccessLayer::new(disk_in, disk_out)));
     let mut monitor_reader = BufReader::new(monitor_in);
