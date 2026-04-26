@@ -343,17 +343,17 @@ struct CompiledPredicate {
 }
 
 fn compile_predicates(predicates: &[Predicate], schema: &Schema) -> Vec<CompiledPredicate> {
-    predicates.iter().map(|pred| {
-        let left_idx = schema.get_index(&pred.column_name).unwrap_or(0);
+    predicates.iter().filter_map(|pred| {
+        let left_idx = schema.get_index(&pred.column_name)?;
         let right_val = match &pred.value {
-            ComparisionValue::Column(name) => CompiledValue::Column(schema.get_index(name).unwrap_or(0)),
+            ComparisionValue::Column(name) => CompiledValue::Column(schema.get_index(name)?),
             ComparisionValue::I32(v)       => CompiledValue::Literal(Data::Int32(*v)),
             ComparisionValue::I64(v)       => CompiledValue::Literal(Data::Int64(*v)),
             ComparisionValue::F32(v)       => CompiledValue::Literal(Data::Float32(*v)),
             ComparisionValue::F64(v)       => CompiledValue::Literal(Data::Float64(*v)),
             ComparisionValue::String(v)    => CompiledValue::Literal(Data::String(v.clone())),
         };
-        CompiledPredicate { left_idx, operator: pred.operator.clone(), right_val }
+        Some(CompiledPredicate { left_idx, operator: pred.operator.clone(), right_val })
     }).collect()
 }
 
@@ -1087,21 +1087,22 @@ impl<R: Read, W: Write> SortOperator<R, W> {
     /// Max number of runs we can merge simultaneously without exceeding the
     /// memory budget.
     ///
-    /// Each SegmentedRunReader holds:
-    ///   - 1 decoded block  (block_size × 8, worst-case Int32 expansion)
-    ///   - (RUN_PREFETCH_SIZE − 1) raw blocks  (block_size each, not expanded)
+    /// Each SegmentedRunReader holds simultaneously:
+    ///   - raw_buf: ALL RUN_PREFETCH_SIZE raw blocks (never shrunk between decodes)
+    ///   - current_rows: 1 decoded block (8× worst-case Int32 expansion)
     ///   - a HeapEntry key clone
     ///
-    ///   per_run = (7 + RUN_PREFETCH_SIZE) × block_size + key_size
+    ///   per_run = (RUN_PREFETCH_SIZE + 8) × block_size + key_size
     ///   fan_in  = (available − write_buf) / per_run
     fn merge_fan_in(&self) -> usize {
         let write_buf = BATCH_BLOCKS as u64 * self.block_size;
         let available = self.memory_limit_bytes
             .saturating_sub(write_buf) as usize;
 
-        // 1 decoded block (8× expansion) + (RUN_PREFETCH_SIZE-1) raw blocks (1× each).
+        // raw_buf is allocated for all RUN_PREFETCH_SIZE raw blocks at once (never
+        // partially freed), plus 1 decoded block at 8× expansion.
         let key_size = 24 + self.sort_specs.len() * 40;
-        let per_run  = (7 + RUN_PREFETCH_SIZE as usize) * self.block_size as usize + key_size;
+        let per_run  = (RUN_PREFETCH_SIZE as usize + 8) * self.block_size as usize + key_size;
         (available / per_run.max(1)).max(2)
     }
 
@@ -1419,18 +1420,11 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
         let mut right_key_idx = Vec::new();
 
         for pred in &predicates {
-            if !matches!(pred.operator, ComparisionOperator::EQ) {
-                anyhow::bail!(
-                    "SortMergeJoin: non-equi predicate on column '{}' — SMJ only supports equi-joins",
-                    pred.column_name
-                );
-            }
+            // Only EQ column=column predicates form SMJ keys; skip everything else.
+            if !matches!(pred.operator, ComparisionOperator::EQ) { continue; }
             let other_col = match &pred.value {
                 ComparisionValue::Column(c) => c,
-                _ => anyhow::bail!(
-                    "SortMergeJoin: predicate on '{}' compares against a literal — SMJ only supports column=column",
-                    pred.column_name
-                ),
+                _ => continue,
             };
 
             // Determine which column is from which side
@@ -1449,10 +1443,7 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
                 right_key_idx.push(ri);
                 continue;
             }
-            anyhow::bail!(
-                "SortMergeJoin: predicate '{} = {}' does not reference one column from each side",
-                pred.column_name, other_col
-            );
+            // Predicate doesn't span the two sides — skip (residual handled by Filter wrapper).
         }
 
         if left_key_idx.is_empty() {

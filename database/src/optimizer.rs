@@ -313,7 +313,35 @@ fn build_join_tree(inputs: Vec<QueryOp>, predicates: Vec<Predicate>, catalog: &C
         });
     }
 
-    current
+    // Ensure every Join node in the produced tree (not just the root) has Sort
+    // nodes added for SMJ — this would normally happen in the next optimizer
+    // pass, but doing it here avoids any reliance on pass ordering.
+    apply_sort_requirements_recursive(current, catalog)
+}
+
+fn apply_sort_requirements_recursive(op: QueryOp, catalog: &Catalog) -> QueryOp {
+    match op {
+        QueryOp::Join(d) => {
+            let left  = apply_sort_requirements_recursive(*d.left,  catalog);
+            let right = apply_sort_requirements_recursive(*d.right, catalog);
+            let joined = QueryOp::Join(JoinData {
+                left:       Box::new(left),
+                right:      Box::new(right),
+                predicates: d.predicates,
+                algorithm:  d.algorithm,
+            });
+            select_join_algorithm(joined, catalog)
+        }
+        QueryOp::Filter(d) => QueryOp::Filter(FilterData {
+            underlying: Box::new(apply_sort_requirements_recursive(*d.underlying, catalog)),
+            predicates: d.predicates,
+        }),
+        QueryOp::Sort(d) => QueryOp::Sort(SortData {
+            underlying: Box::new(apply_sort_requirements_recursive(*d.underlying, catalog)),
+            sort_specs:  d.sort_specs,
+        }),
+        other => other,
+    }
 }
 
 fn push_selections(op: QueryOp, catalog: &Catalog) -> QueryOp {
