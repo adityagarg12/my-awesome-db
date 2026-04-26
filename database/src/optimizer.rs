@@ -11,8 +11,16 @@ use crate::catalog::Catalog;
 
 pub fn optimize(op: QueryOp, catalog: &Catalog) -> QueryOp {
     let op = bottom_up_pass(op, catalog);
-    let op = bottom_up_pass(op, catalog); 
-    push_projections(op, None, catalog)   
+    let op = bottom_up_pass(op, catalog);
+    // Seed projection-pushdown with the actual top-of-plan output columns
+    // instead of `None` ("everything"). For plans whose root is a Project
+    // (every realistic query) this is identical to passing `None`, but it
+    // makes the invariant explicit: nothing above this layer can ever
+    // reference a column not in `top_cols`, so child operators are free to
+    // narrow on it. Removes the surprise that top-level Cross/Join with no
+    // Project above would silently keep every column of every table.
+    let top_cols: HashSet<String> = derive_columns_set(&op, catalog);
+    push_projections(op, Some(&top_cols), catalog)
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,38 @@
 use std::collections::{BinaryHeap, HashMap};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
+
+// ---------------------------------------------------------------------------
+// FNV-1a 64-bit hasher
+//
+// Tiny non-cryptographic hash used for grace-hash-join partitioning and the
+// build-side HashMap. ~3-4× faster than DefaultHasher (SipHash) on the short
+// composite keys we feed it (a few Ints/Strings) and avoids the per-hash
+// random-state allocation. No external dep required.
+// ---------------------------------------------------------------------------
+#[derive(Default, Clone)]
+struct FnvHasher { state: u64 }
+
+impl FnvHasher {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME:  u64 = 0x100000001b3;
+    fn new() -> Self { Self { state: Self::OFFSET } }
+}
+
+impl Hasher for FnvHasher {
+    #[inline]
+    fn finish(&self) -> u64 { self.state }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut s = self.state;
+        for &b in bytes {
+            s ^= b as u64;
+            s = s.wrapping_mul(Self::PRIME);
+        }
+        self.state = s;
+    }
+}
+
+type FnvHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FnvHasher>>;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use anyhow::{Result, anyhow};
@@ -109,7 +141,12 @@ const RUN_PREFETCH_SIZE: u64 = 32;
 
 // Grace hash join parameters.
 const HASH_PARTITIONS: usize = 32;
-const HASH_PARTITION_BATCH_BLOCKS: usize = 16;
+// Larger per-partition write batches reduce both write_blocks IPC count and
+// the cylinder-seek count per partition during read-back. 32 blocks = 128 KB
+// per write. Total pending RAM = HASH_PARTITIONS × 2 sides × 32 × block_size
+// ≈ 8 MB at 4 KB blocks — well within the join's memory budget (10 ×
+// per-operator), and unrelated to dataset size.
+const HASH_PARTITION_BATCH_BLOCKS: usize = 32;
 
 /// Encoded byte length of one row without allocating any buffer.
 /// Must stay in sync with encode_row / encode_value in row.rs.
@@ -842,13 +879,13 @@ struct PartitionBuffer {
 }
 
 impl PartitionBuffer {
-    fn new(block_size: usize) -> Self {
+    fn new() -> Self { 
         Self {
             extents: Vec::new(),
-            block: vec![0u8; block_size],
+            block: Vec::new(),   // <--- 0 bytes
             block_off: 0,
             rows_in_block: 0,
-            pending: vec![0u8; HASH_PARTITION_BATCH_BLOCKS * block_size],
+            pending: Vec::new(), // <--- 0 bytes
             pending_blocks: 0,
         }
     }
@@ -874,7 +911,12 @@ pub struct HashJoinOperator<R: Read, W: Write> {
     right_partitions: Vec<PartitionBuffer>,
 
     probe_partition_idx: usize,
-    left_hash: HashMap<Vec<Data>, Vec<Row>>,
+    left_hash: FnvHashMap<Vec<Data>, Vec<Row>>,
+    /// Set during left-spill: entry `i` is true if left partition `i` has at
+    /// least one row written. Used to drop right rows whose partition has no
+    /// left counterpart — eliminates wasted writes (and the corresponding
+    /// future reads / cylinder seeks) for non-matching partitions.
+    non_empty_left: Vec<bool>,
     current_right_reader: Option<SegmentedRunReader<R, W>>,
     current_right_extents: Vec<(u64, u64)>,
     current_right_row: Option<Row>,
@@ -930,10 +972,10 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
 
         let partition_count = HASH_PARTITIONS;
         let left_partitions = (0..partition_count)
-            .map(|_| PartitionBuffer::new(block_size as usize))
+            .map(|_| PartitionBuffer::new())
             .collect();
         let right_partitions = (0..partition_count)
-            .map(|_| PartitionBuffer::new(block_size as usize))
+            .map(|_| PartitionBuffer::new())
             .collect();
 
         Ok(Self {
@@ -954,7 +996,8 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
             left_partitions,
             right_partitions,
             probe_partition_idx: 0,
-            left_hash: HashMap::new(),
+            left_hash: FnvHashMap::default(),
+            non_empty_left: vec![false; partition_count],
             current_right_reader: None,
             current_right_extents: Vec::new(),
             current_right_row: None,
@@ -970,9 +1013,13 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
     }
 
     fn partition_for_row(row: &Row, key_indices: &[usize], partition_count: usize) -> usize {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = FnvHasher::new();
         for &idx in key_indices {
-            row.get(idx).cloned().unwrap_or(Data::Int32(0)).hash(&mut hasher);
+            if let Some(v) = row.get(idx) {
+                v.hash(&mut hasher);
+            } else {
+                Data::Int32(0).hash(&mut hasher);
+            }
         }
         (hasher.finish() as usize) % partition_count
     }
@@ -984,6 +1031,15 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
         partition: &mut PartitionBuffer,
         encoded: &[u8],
     ) -> Result<()> {
+
+        // LAZY ALLOCATION: Only allocate physical memory the very first time 
+        // a row is actually routed to this specific partition!
+        // This prevents the AST builder from pre-allocating 67MB of empty buffers.
+        if partition.block.is_empty() {
+            partition.block = vec![0u8; block_size as usize];
+            partition.pending = vec![0u8; HASH_PARTITION_BATCH_BLOCKS * block_size as usize];
+        }
+
         let usable = block_size as usize - 2;
         if partition.block_off + encoded.len() > usable {
             Self::flush_partition_block(block_size, disk_access, anon_allocator, partition)?;
@@ -1002,7 +1058,7 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
         anon_allocator: &AnonBlockAllocator,
         partition: &mut PartitionBuffer,
     ) -> Result<()> {
-        if partition.rows_in_block == 0 {
+        if partition.rows_in_block == 0 || partition.block.is_empty() {
             return Ok(());
         }
 
@@ -1034,9 +1090,7 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
         anon_allocator: &AnonBlockAllocator,
         partition: &mut PartitionBuffer,
     ) -> Result<()> {
-        if partition.pending_blocks == 0 {
-            return Ok(());
-        }
+        if partition.pending_blocks == 0 || partition.pending.is_empty() { return Ok(()); }
 
         let bs = block_size as usize;
         let n = partition.pending_blocks as u64;
@@ -1056,8 +1110,26 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
         partitions: &mut [PartitionBuffer],
         cols: &[ColumnCatalog],
         key_indices: &[usize],
+        // If Some(mask), rows whose target partition has mask[idx] == false
+        // are dropped (no encode, no write). Used on the probe (right) side
+        // to skip partitions that have an empty build (left) side — those
+        // rows can never produce a join match.
+        keep_partition: Option<&[bool]>,
+        // If Some(mask), each row that IS spilled marks mask[idx] = true.
+        // Used on the build (left) side to record which partitions are
+        // non-empty for the subsequent probe-side spill.
+        record_non_empty: Option<&mut [bool]>,
     ) -> Result<()> {
+        let mut record = record_non_empty;
         while let Some(row) = child.next()? {
+            let partition_idx = Self::partition_for_row(&row, key_indices, partition_count);
+
+            if let Some(mask) = keep_partition {
+                if !mask[partition_idx] {
+                    continue;
+                }
+            }
+
             let encoded = encode_row(&row, cols)?;
             if encoded.len() > block_size as usize - 2 {
                 anyhow::bail!(
@@ -1067,8 +1139,10 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
                 );
             }
 
-            let partition_idx = Self::partition_for_row(&row, key_indices, partition_count);
             Self::append_encoded_row(block_size, disk_access, anon_allocator, &mut partitions[partition_idx], &encoded)?;
+            if let Some(m) = record.as_deref_mut() {
+                m[partition_idx] = true;
+            }
         }
 
         for partition in partitions.iter_mut() {
@@ -1162,7 +1236,12 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
             &mut self.left_partitions,
             &left_cols,
             &left_key_idx,
+            None,
+            Some(&mut self.non_empty_left),
         )?;
+        // Drop the build-side iterator BEFORE consuming the probe side so any
+        // resources it holds (open files, prefetch buffers) are released.
+        drop(left);
         Self::spill_side(
             block_size,
             partition_count,
@@ -1172,7 +1251,18 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
             &mut self.right_partitions,
             &right_cols,
             &right_key_idx,
+            Some(&self.non_empty_left),
+            None,
         )?;
+
+       for p in &mut self.left_partitions {
+            p.block = Vec::new();
+            p.pending = Vec::new();
+        }
+        for p in &mut self.right_partitions {
+            p.block = Vec::new();
+            p.pending = Vec::new();
+        }
 
         self.initialized = true;
         Ok(())
