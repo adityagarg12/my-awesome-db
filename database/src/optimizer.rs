@@ -408,34 +408,6 @@ fn eliminate_redundant_sort(op: QueryOp) -> QueryOp {
 // The Sort nodes added here are subject to `eliminate_redundant_sort` on the
 // next pass if the input happens to already be sorted.
 // ---------------------------------------------------------------------------
-fn extract_join_key_cols(
-    predicates: &[Predicate],
-    left: &QueryOp,
-    right: &QueryOp,
-    catalog: &Catalog,
-) -> (Vec<String>, Vec<String>) {
-    let left_set  = derive_columns_set(left,  catalog);
-    let right_set = derive_columns_set(right, catalog);
-
-    let mut left_key  = Vec::new();
-    let mut right_key = Vec::new();
-
-    for pred in predicates {
-        // Only EQ column=column predicates are valid SMJ sort keys.
-        if !matches!(pred.operator, ComparisionOperator::EQ) { continue; }
-        if let ComparisionValue::Column(other) = &pred.value {
-            if left_set.contains(&pred.column_name) && right_set.contains(other) {
-                left_key.push(pred.column_name.clone());
-                right_key.push(other.clone());
-            } else if right_set.contains(&pred.column_name) && left_set.contains(other) {
-                left_key.push(other.clone());
-                right_key.push(pred.column_name.clone());
-            }
-        }
-    }
-    (left_key, right_key)
-}
-
 fn make_sort_specs(key_cols: &[String]) -> Vec<SortSpec> {
     key_cols.iter()
         .map(|col| SortSpec { column_name: col.clone(), ascending: true })
@@ -443,39 +415,82 @@ fn make_sort_specs(key_cols: &[String]) -> Vec<SortSpec> {
 }
 
 fn select_join_algorithm(op: QueryOp, catalog: &Catalog) -> QueryOp {
-    let QueryOp::Join(mut d) = op else { return op; };
+    let QueryOp::Join(d) = op else { return op; };
 
-    let (left_key, right_key) = extract_join_key_cols(&d.predicates, &d.left, &d.right, catalog);
+    let left_set  = derive_columns_set(&d.left,  catalog);
+    let right_set = derive_columns_set(&d.right, catalog);
+
+    // Split predicates: equi column=column spanning both sides → SMJ keys;
+    // everything else → residual Filter applied above the join so no predicate
+    // is silently dropped.
+    let mut left_key:   Vec<String>    = Vec::new();
+    let mut right_key:  Vec<String>    = Vec::new();
+    let mut equi_preds: Vec<Predicate> = Vec::new();
+    let mut residual:   Vec<Predicate> = Vec::new();
+
+    for pred in d.predicates {
+        let mut is_equi = false;
+        if matches!(pred.operator, ComparisionOperator::EQ) {
+            if let ComparisionValue::Column(other) = &pred.value {
+                if left_set.contains(&pred.column_name) && right_set.contains(other.as_str()) {
+                    left_key.push(pred.column_name.clone());
+                    right_key.push(other.clone());
+                    is_equi = true;
+                } else if right_set.contains(&pred.column_name) && left_set.contains(other.as_str()) {
+                    left_key.push(other.clone());
+                    right_key.push(pred.column_name.clone());
+                    is_equi = true;
+                }
+            }
+        }
+        if is_equi {
+            equi_preds.push(pred);
+        } else {
+            residual.push(pred);
+        }
+    }
 
     if left_key.is_empty() {
-        // Defensive rewrite: preserve semantics without introducing a BNLJ fallback.
+        // No equi-join keys: rewrite as Filter(Cross) so all predicates are evaluated.
         return QueryOp::Filter(FilterData {
             underlying: Box::new(QueryOp::Cross(CrossData {
                 left: d.left,
                 right: d.right,
             })),
-            predicates: d.predicates,
+            predicates: if residual.is_empty() { equi_preds } else { residual },
         });
     }
 
     let left_specs  = make_sort_specs(&left_key);
     let right_specs = make_sort_specs(&right_key);
 
-    if !is_sorted_on(&d.left, &left_specs) {
-        d.left = Box::new(QueryOp::Sort(SortData {
-            underlying: d.left,
-            sort_specs: left_specs,
-        }));
-    }
-    if !is_sorted_on(&d.right, &right_specs) {
-        d.right = Box::new(QueryOp::Sort(SortData {
-            underlying: d.right,
-            sort_specs: right_specs,
-        }));
-    }
+    let left_child = if !is_sorted_on(&d.left, &left_specs) {
+        Box::new(QueryOp::Sort(SortData { underlying: d.left, sort_specs: left_specs }))
+    } else {
+        d.left
+    };
+    let right_child = if !is_sorted_on(&d.right, &right_specs) {
+        Box::new(QueryOp::Sort(SortData { underlying: d.right, sort_specs: right_specs }))
+    } else {
+        d.right
+    };
 
-    d.algorithm = JoinAlgorithm::SortMerge;
-    QueryOp::Join(d)
+    let join_node = QueryOp::Join(JoinData {
+        left:       left_child,
+        right:      right_child,
+        predicates: equi_preds,
+        algorithm:  JoinAlgorithm::SortMerge,
+    });
+
+    // Wrap residual (non-equi) predicates above the join so they are always evaluated.
+    if residual.is_empty() {
+        join_node
+    } else {
+        QueryOp::Filter(FilterData {
+            underlying: Box::new(join_node),
+            predicates: residual,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
