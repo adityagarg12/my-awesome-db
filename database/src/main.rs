@@ -78,12 +78,13 @@ fn db_main() -> Result<()> {
     };
     let anon_allocator = AnonBlockAllocator::new(anon_start);
 
-    // Reserve memory for the shared buffer pool (256 blocks) and per-ScanOperator
-    // prefetch buffers (16 blocks each; at most 2 scan operators run concurrently
-    // in a join query).  Operators receive a reduced limit so they don't over-allocate
-    // and exceed the total process memory ceiling.
-    const BUFFER_POOL_BLOCKS: u64 = 256;
-    const PREFETCH_BLOCKS_PER_SCAN: u64 = 16;
+    // Reserve memory for the shared buffer pool and per-ScanOperator prefetch buffers
+    // so operators receive a reduced limit that keeps total allocation under RLIMIT_AS.
+    //
+    // BUFFER_POOL_BLOCKS must match BlockCache::new(N) in DiskAccessLayer::new().
+    // PREFETCH_BLOCKS_PER_SCAN must match PREFETCH_SIZE in executor.rs.
+    const BUFFER_POOL_BLOCKS: u64 = 512;      // 512 × 4 KB = 2 MB cache
+    const PREFETCH_BLOCKS_PER_SCAN: u64 = 32; // 32 × 4 KB = 128 KB per scan prefetch
     const MAX_CONCURRENT_SCANS: u64 = 2;
     let buffer_reserved = (BUFFER_POOL_BLOCKS + PREFETCH_BLOCKS_PER_SCAN * MAX_CONCURRENT_SCANS)
         .saturating_mul(block_size);

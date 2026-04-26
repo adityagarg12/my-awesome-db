@@ -87,7 +87,9 @@ pub trait Operator {
 }
 
 // Number of blocks the ScanOperator fetches in a single disk command.
-const PREFETCH_SIZE: u64 = 16;
+// Also used by CrossOperator's right-side block loader (read_block_with_prefetch).
+// Matching PREFETCH_BLOCKS_PER_SCAN in main.rs so memory reservation stays accurate.
+const PREFETCH_SIZE: u64 = 32;
 
 // Blocks written per write_blocks IPC call in spill/merge paths.
 // 256 blocks × 4 KB = 1 MB write buffer — reduces IPC round trips while
@@ -95,10 +97,13 @@ const PREFETCH_SIZE: u64 = 16;
 const BATCH_BLOCKS: usize = 256;
 
 // Blocks fetched per read_blocks IPC call inside SegmentedRunReader.
-// Raw bytes are held in a prefetch buffer; only ONE block is decoded at a time,
-// keeping decoded memory per reader at block_size×8 regardless of this value.
-// Larger values reduce disk round-trips without ballooning in-RAM decoded data.
-const RUN_PREFETCH_SIZE: u64 = 16;
+// Raw bytes are held in a prefetch buffer; only ONE block is decoded at a time.
+// 32 blocks = 128 KB per fetch: halves run-switch disk calls in k-way merge,
+// cutting non-sequential rotational-latency hits roughly in half.
+// fan_in scales inversely (per_run grows), so total merge memory is unchanged:
+//   fan_in = available / per_run  →  fan_in × per_run ≈ constant.
+// Must stay in sync with PREFETCH_BLOCKS_PER_SCAN in main.rs (same buffer pool).
+const RUN_PREFETCH_SIZE: u64 = 32;
 
 /// Encoded byte length of one row without allocating any buffer.
 /// Must stay in sync with encode_row / encode_value in row.rs.

@@ -57,7 +57,11 @@ impl<R: Read, W: Write> DiskAccessLayer<R, W> {
             reader: BufReader::new(reader),
             writer,
             block_size_cache: None,
-            cache: BlockCache::new(256),
+            // 512 blocks × 4 KB = 2 MB.  Doubles the window for cache hits:
+            // B-NLJ right sides ≤ 2 MB are fully served from cache on re-scans,
+            // and more sort-run blocks survive between write and merge-read.
+            // BUFFER_POOL_BLOCKS in main.rs is updated to match this value.
+            cache: BlockCache::new(512),
         }
     }
 
