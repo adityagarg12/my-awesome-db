@@ -454,8 +454,22 @@ fn select_join_algorithm(op: QueryOp, catalog: &Catalog) -> QueryOp {
         });
     }
 
+    // Smaller-side build: when the right side is *substantially* smaller
+    // than the left, swap so HashJoin's build (left) is the small side.
+    // This lets the hybrid in-memory path fire and skip both partitions'
+    // spills entirely. The 4× threshold is deliberately conservative so we
+    // don't disturb already-balanced join orderings (which previously caused
+    // a regression at smaller ratios). HashJoinOperator::new resolves
+    // predicate columns from both sides, so swapping is safe with no
+    // predicate adjustment.
+    let lsz = estimate_op_size(&d.left,  catalog);
+    let rsz = estimate_op_size(&d.right, catalog);
+    if rsz * 4.0 < lsz {
+        std::mem::swap(&mut d.left, &mut d.right);
+    }
+
     d.algorithm = JoinAlgorithm::HashJoin;
-    d.predicates = smj_preds; 
+    d.predicates = smj_preds;
 
     let join_op = QueryOp::Join(d);
 
@@ -587,7 +601,7 @@ fn narrow_join_inputs(
 // Size estimation
 // ---------------------------------------------------------------------------
 
-fn estimate_op_size(op: &QueryOp, catalog: &Catalog) -> f64 {
+pub fn estimate_op_size(op: &QueryOp, catalog: &Catalog) -> f64 {
     match op {
         QueryOp::Scan(d) => {
             catalog.get_table(&d.table_id)
@@ -600,7 +614,21 @@ fn estimate_op_size(op: &QueryOp, catalog: &Catalog) -> f64 {
         }
         QueryOp::Project(d) => estimate_op_size(&d.underlying, catalog),
         QueryOp::Sort(d)    => estimate_op_size(&d.underlying, catalog),
-        _ => 100_000.0,
+        // Equi-join, PK-FK shape (the common TPC-H case): output cardinality
+        // ≈ the larger side's row count (each FK row matches exactly one PK
+        // row). Pessimistic for filtered joins, accurate enough for the
+        // greedy join-tree builder + the build/probe-side swap heuristic.
+        QueryOp::Join(d) => {
+            let l = estimate_op_size(&d.left,  catalog);
+            let r = estimate_op_size(&d.right, catalog);
+            l.max(r)
+        }
+        // Cartesian product.
+        QueryOp::Cross(d) => {
+            let l = estimate_op_size(&d.left,  catalog);
+            let r = estimate_op_size(&d.right, catalog);
+            l * r
+        }
     }
 }
 
