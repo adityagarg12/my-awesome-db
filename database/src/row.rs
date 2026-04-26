@@ -92,7 +92,29 @@ pub fn decode_row(
     Ok(Row { values })
 }
 
-fn decode_value(bytes: &[u8], offset: usize, data_type: &DataType) -> Result<(Data, usize)> {
+/// Skip one encoded value of `data_type` at `*offset` without decoding or allocating.
+pub fn skip_value_at(bytes: &[u8], offset: &mut usize, data_type: &DataType) -> Result<()> {
+    match data_type {
+        DataType::Int32 | DataType::Float32 => {
+            if *offset + 4 > bytes.len() { bail!("Not enough bytes to skip field"); }
+            *offset += 4;
+            Ok(())
+        }
+        DataType::Int64 | DataType::Float64 => {
+            if *offset + 8 > bytes.len() { bail!("Not enough bytes to skip field"); }
+            *offset += 8;
+            Ok(())
+        }
+        DataType::String => {
+            while *offset < bytes.len() && bytes[*offset] != 0 { *offset += 1; }
+            if *offset >= bytes.len() { bail!("String missing null terminator during skip"); }
+            *offset += 1;
+            Ok(())
+        }
+    }
+}
+
+pub fn decode_value(bytes: &[u8], offset: usize, data_type: &DataType) -> Result<(Data, usize)> {
     match data_type {
         DataType::Int32 => {
             if offset + 4 > bytes.len() {

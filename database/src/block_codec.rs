@@ -1,5 +1,5 @@
 use anyhow::{Result, bail, Context};
-use crate::row::{Row, decode_row, encode_row};
+use crate::row::{Row, decode_row, encode_row, decode_value, skip_value_at};
 use crate::catalog::ColumnCatalog;
 
 /// Decode a single block into a vector of rows.
@@ -48,6 +48,62 @@ pub fn decode_block(
             .context(format!("Failed to decode row {}", i))?;
 
         rows.push(row);
+    }
+
+    Ok(rows)
+}
+
+/// Decode a block, emitting only the columns at `needed_indices` (sorted ascending).
+/// Columns not in `needed_indices` are skipped without allocation.
+/// Output rows have values in the same order as `needed_indices`.
+pub fn decode_block_projected(
+    block_bytes: &[u8],
+    block_size: u64,
+    all_columns: &[ColumnCatalog],
+    needed_indices: &[usize],
+) -> Result<Vec<Row>> {
+    if block_bytes.len() as u64 != block_size {
+        bail!("Block size mismatch: expected {} bytes, got {}", block_size, block_bytes.len());
+    }
+
+    let row_count_offset = block_size as usize - 2;
+    if row_count_offset < 2 {
+        bail!("Block size too small to contain row_count footer");
+    }
+
+    let row_count = u16::from_le_bytes([
+        block_bytes[row_count_offset],
+        block_bytes[row_count_offset + 1],
+    ]) as usize;
+
+    let usable = &block_bytes[..row_count_offset];
+    let mut rows = Vec::with_capacity(row_count);
+    let mut offset = 0usize;
+
+    for i in 0..row_count {
+        if offset >= row_count_offset {
+            bail!(
+                "Row {} starts at offset {} but usable block space ends at {}",
+                i, offset, row_count_offset
+            );
+        }
+
+        let mut values = Vec::with_capacity(needed_indices.len());
+        let mut need_pos = 0usize;
+
+        for (col_idx, col) in all_columns.iter().enumerate() {
+            if need_pos < needed_indices.len() && needed_indices[need_pos] == col_idx {
+                let (value, bytes_read) = decode_value(usable, offset, &col.data_type)
+                    .with_context(|| format!("Failed to decode column '{}'", col.name))?;
+                offset += bytes_read;
+                values.push(value);
+                need_pos += 1;
+            } else {
+                skip_value_at(usable, &mut offset, &col.data_type)
+                    .with_context(|| format!("Failed to skip column '{}'", col.name))?;
+            }
+        }
+        rows.push(Row::new(values));
     }
 
     Ok(rows)

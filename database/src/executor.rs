@@ -7,7 +7,7 @@ use common::query::{ComparisionOperator, ComparisionValue, JoinAlgorithm, Predic
 use crate::catalog::{Catalog, ColumnCatalog, TableCatalog};
 use crate::disk_access::DiskAccessLayer;
 use crate::row::{Row, data_compare, encode_row};
-use crate::block_codec::decode_block;
+use crate::block_codec::{decode_block, decode_block_projected};
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -228,6 +228,11 @@ impl AnonBlockAllocator {
 pub struct ScanOperator<R: Read, W: Write> {
     disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
     schema: Schema,
+    /// Full table column list used by the projected decode path.
+    /// Empty when decoding all columns (non-projected path).
+    all_columns: Vec<ColumnCatalog>,
+    /// Sorted column indices to decode; empty = decode all (use schema directly).
+    needed_indices: Vec<usize>,
     file_id: String,
     block_size: u64,
     // Populated on first next()
@@ -255,6 +260,8 @@ impl<R: Read, W: Write> ScanOperator<R, W> {
         ScanOperator {
             disk_access,
             schema: Schema::from_table(table),
+            all_columns: Vec::new(),
+            needed_indices: Vec::new(),
             file_id: table.file_id.clone(),
             block_size,
             start_block: 0,
@@ -267,6 +274,55 @@ impl<R: Read, W: Write> ScanOperator<R, W> {
             current_row_idx: 0,
             initialized: false,
         }
+    }
+
+    /// Build a scan that decodes only the columns named in `needed_col_names`.
+    /// The output schema lists those columns in table order (sorted by original index).
+    pub fn new_projected(
+        disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
+        table: &TableCatalog,
+        block_size: u64,
+        needed_col_names: &[String],
+    ) -> Result<Self> {
+        let all_columns = table.columns().to_vec();
+        let name_to_idx: HashMap<&str, usize> = all_columns.iter()
+            .enumerate()
+            .map(|(i, c)| (c.name.as_str(), i))
+            .collect();
+
+        let mut needed_indices: Vec<usize> = needed_col_names.iter()
+            .filter_map(|n| name_to_idx.get(n.as_str()).copied())
+            .collect();
+        needed_indices.sort_unstable();
+        needed_indices.dedup();
+
+        // Build narrowed schema in table order.
+        let narrow_columns: Vec<ColumnCatalog> = needed_indices.iter()
+            .enumerate()
+            .map(|(new_idx, &old_idx)| ColumnCatalog {
+                name: all_columns[old_idx].name.clone(),
+                index: new_idx,
+                data_type: all_columns[old_idx].data_type.clone(),
+            })
+            .collect();
+
+        Ok(ScanOperator {
+            disk_access,
+            schema: Schema::new(narrow_columns),
+            all_columns,
+            needed_indices,
+            file_id: table.file_id.clone(),
+            block_size,
+            start_block: 0,
+            num_blocks: 0,
+            next_block_to_fetch: 0,
+            prefetch_buf: Vec::new(),
+            prefetch_count: 0,
+            prefetch_idx: 0,
+            current_rows: Vec::new(),
+            current_row_idx: 0,
+            initialized: false,
+        })
     }
 
     fn initialize(&mut self) -> Result<()> {
@@ -303,7 +359,11 @@ impl<R: Read, W: Write> ScanOperator<R, W> {
         let offset = (self.prefetch_idx * self.block_size) as usize;
         let rows = {
             let block_slice = &self.prefetch_buf[offset..offset + self.block_size as usize];
-            decode_block(block_slice, self.block_size, self.schema.columns())?
+            if self.needed_indices.is_empty() {
+                decode_block(block_slice, self.block_size, self.schema.columns())?
+            } else {
+                decode_block_projected(block_slice, self.block_size, &self.all_columns, &self.needed_indices)?
+            }
         };
         self.current_rows = rows;
         self.current_row_idx = 0;
@@ -1872,6 +1932,20 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
         }
 
         QueryOp::Project(d) => {
+            if let QueryOp::Scan(sd) = &*d.underlying {
+                let table = catalog.get_table(&sd.table_id)
+                    .ok_or_else(|| anyhow!("Scan: table '{}' not found", sd.table_id))?;
+                // Collect unique source column names referenced by the projection.
+                let mut needed: Vec<String> = Vec::new();
+                for (from, _) in &d.column_name_map {
+                    if !needed.iter().any(|c| c == from) {
+                        needed.push(from.clone());
+                    }
+                }
+                let scan = ScanOperator::new_projected(disk_access, table, block_size, &needed)?;
+                return Ok(Box::new(ProjectOperator::new(Box::new(scan), d.column_name_map.clone())?));
+            }
+
             if let QueryOp::Sort(s) = &*d.underlying {
                 let mut needed: Vec<String> = Vec::new();
                 for (from, _) in &d.column_name_map {
