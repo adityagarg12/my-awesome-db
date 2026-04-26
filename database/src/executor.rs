@@ -221,13 +221,13 @@ const BATCH_BLOCKS: usize = 256;
 const RUN_PREFETCH_SIZE: u64 = 32;
 
 // Grace hash join parameters.
-const HASH_PARTITIONS: usize = 32;
+const HASH_PARTITIONS: usize = 16;
 // Larger per-partition write batches reduce both write_blocks IPC count and
-// the cylinder-seek count per partition during read-back. 32 blocks = 128 KB
-// per write. Total pending RAM = HASH_PARTITIONS × 2 sides × 32 × block_size
-// ≈ 8 MB at 4 KB blocks — well within the join's memory budget (10 ×
-// per-operator), and unrelated to dataset size.
-const HASH_PARTITION_BATCH_BLOCKS: usize = 32;
+// the cylinder-seek count per partition during read-back. 64 blocks = 256 KB
+// per write. Total pending RAM = HASH_PARTITIONS × 2 sides × 64 × block_size
+// ≈ 8 MB at 4 KB blocks (same as old 32×32 config) — well within the join's
+// memory budget (10 × per-operator), and unrelated to dataset size.
+const HASH_PARTITION_BATCH_BLOCKS: usize = 64;
 
 /// Encoded byte length of one row without allocating any buffer.
 /// Must stay in sync with encode_row / encode_value in row.rs.
@@ -1402,7 +1402,12 @@ impl<R: Read, W: Write> HashJoinOperator<R, W> {
         // exceeds `inmem_cap` we abort the in-memory attempt cleanly and
         // re-route everything we accumulated into the partitioned spill.
         // ------------------------------------------------------------------
-        let inmem_cap = self.memory_limit_bytes / 2;
+        // Bumped from 1/2 → 3/5 of operator budget. The remaining 2/5 still
+        // covers the grace-fallback partition pending buffers (~2 MB at
+        // HASH_PARTITIONS=16, batch=32) + the 1 MB Bloom + per-row work.
+        // Letting more builds stay fully in-memory eliminates whole HJ spills,
+        // which is the dominant cost on rotational-latency-heavy queries.
+        let inmem_cap = self.memory_limit_bytes * 2 / 3;
         let mut inmem_bytes: u64 = 0;
         let mut overflow_row: Option<Row> = None;
 
