@@ -296,9 +296,15 @@ impl<R: Read, W: Write> ScanOperator<R, W> {
             .map(|(i, c)| (c.name.as_str(), i))
             .collect();
 
-        let mut needed_indices: Vec<usize> = needed_col_names.iter()
-            .filter_map(|n| name_to_idx.get(n.as_str()).copied())
-            .collect();
+        let mut needed_indices: Vec<usize> = Vec::with_capacity(needed_col_names.len());
+        for n in needed_col_names {
+            let idx = name_to_idx.get(n.as_str()).copied()
+                .ok_or_else(|| anyhow!(
+                    "ScanOperator::new_projected: column '{}' not found in table '{}'",
+                    n, table.name
+                ))?;
+            needed_indices.push(idx);
+        }
         needed_indices.sort_unstable();
         needed_indices.dedup();
 
@@ -2373,8 +2379,16 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
                         needed.push(from.clone());
                     }
                 }
-                let scan = ScanOperator::new_projected(disk_access, table, block_size, &needed)?;
-                return Ok(Box::new(ProjectOperator::new(Box::new(scan), d.column_name_map.clone())?));
+                // Only take the projected-decode fast path when every `from`
+                // is a real column of this table. Otherwise fall through to
+                // the standard Scan + ProjectOperator path so the original
+                // (full-decode) name resolution / error message applies.
+                let all_resolved = needed.iter().all(|n|
+                    table.columns().iter().any(|c| c.name == *n));
+                if all_resolved {
+                    let scan = ScanOperator::new_projected(disk_access, table, block_size, &needed)?;
+                    return Ok(Box::new(ProjectOperator::new(Box::new(scan), d.column_name_map.clone())?));
+                }
             }
 
             if let QueryOp::Sort(s) = &*d.underlying {
