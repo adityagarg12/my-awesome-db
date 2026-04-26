@@ -204,7 +204,7 @@ pub trait Operator {
 // Number of blocks the ScanOperator fetches in a single disk command.
 // Also used by CrossOperator's right-side block loader (read_block_with_prefetch).
 // Matching PREFETCH_BLOCKS_PER_SCAN in main.rs so memory reservation stays accurate.
-const PREFETCH_SIZE: u64 = 32;
+const PREFETCH_SIZE: u64 = 64;
 
 // Blocks written per write_blocks IPC call in spill/merge paths.
 // 256 blocks × 4 KB = 1 MB write buffer — reduces IPC round trips while
