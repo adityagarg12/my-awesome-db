@@ -162,21 +162,37 @@ impl Schema {
         self.columns.len()
     }
 
-    /// Concatenate two schemas (for Cross product).
+    /// Concatenate two schemas (for Cross product). Cross/Join shuffles row
+    /// order AND can duplicate values (each left row paired with many right
+    /// rows), so neither physical order nor uniqueness survive — strip both.
+    /// Range/distinct_count of base columns are still informative on the
+    /// merged schema (the SET of values doesn't change), so propagate those.
     pub fn merge(left: &Schema, right: &Schema) -> Self {
         let mut cols = Vec::with_capacity(left.len() + right.len());
         for (i, c) in left.columns.iter().enumerate() {
-            cols.push(ColumnCatalog { name: c.name.clone(), index: i, data_type: c.data_type.clone() });
+            cols.push(ColumnCatalog {
+                name: c.name.clone(), index: i, data_type: c.data_type.clone(),
+                is_physically_ordered: false,
+                is_unique: false,
+                range: c.range.clone(),
+                distinct_count: c.distinct_count,
+            });
         }
         let offset = left.len();
         for (i, c) in right.columns.iter().enumerate() {
-            cols.push(ColumnCatalog { name: c.name.clone(), index: offset + i, data_type: c.data_type.clone() });
+            cols.push(ColumnCatalog {
+                name: c.name.clone(), index: offset + i, data_type: c.data_type.clone(),
+                is_physically_ordered: false,
+                is_unique: false,
+                range: c.range.clone(),
+                distinct_count: c.distinct_count,
+            });
         }
         Self::new(cols)
     }
 
     /// Build the projected schema and return (projected_schema, src_indices).
-    /// `column_map` is [(from_name, to_name)].
+    /// Project preserves rows 1:1, so all per-column stats survive verbatim.
     pub fn project(input: &Schema, column_map: &[(String, String)]) -> Result<(Self, Vec<usize>)> {
         let mut cols = Vec::new();
         let mut src_indices = Vec::new();
@@ -184,7 +200,13 @@ impl Schema {
             let src_idx = input.get_index(from)
                 .ok_or_else(|| anyhow!("Column '{}' not found in schema", from))?;
             let src_col = &input.columns[src_idx];
-            cols.push(ColumnCatalog { name: to.clone(), index: i, data_type: src_col.data_type.clone() });
+            cols.push(ColumnCatalog {
+                name: to.clone(), index: i, data_type: src_col.data_type.clone(),
+                is_physically_ordered: src_col.is_physically_ordered,
+                is_unique: src_col.is_unique,
+                range: src_col.range.clone(),
+                distinct_count: src_col.distinct_count,
+            });
             src_indices.push(src_idx);
         }
         Ok((Self::new(cols), src_indices))
@@ -426,13 +448,20 @@ impl<R: Read, W: Write> ScanOperator<R, W> {
         needed_indices.sort_unstable();
         needed_indices.dedup();
 
-        // Build narrowed schema in table order.
+        // Build narrowed schema in table order. Scan preserves physical
+        // order on each retained column (we just skip the unwanted ones
+        // during decode — row order is unchanged), so all per-column stats
+        // survive intact.
         let narrow_columns: Vec<ColumnCatalog> = needed_indices.iter()
             .enumerate()
             .map(|(new_idx, &old_idx)| ColumnCatalog {
                 name: all_columns[old_idx].name.clone(),
                 index: new_idx,
                 data_type: all_columns[old_idx].data_type.clone(),
+                is_physically_ordered: all_columns[old_idx].is_physically_ordered,
+                is_unique: all_columns[old_idx].is_unique,
+                range: all_columns[old_idx].range.clone(),
+                distinct_count: all_columns[old_idx].distinct_count,
             })
             .collect();
 

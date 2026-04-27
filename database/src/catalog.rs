@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, bail};
-use common::DataType;
+use common::{Data, DataType};
 use db_config::{DbContext, table::TableSpec};
 use db_config::statistics::ColumnStat;
 
@@ -10,6 +10,25 @@ pub struct ColumnCatalog {
     pub name: String,
     pub index: usize,
     pub data_type: DataType,
+    /// True when this column's values are in ascending order as rows are read
+    /// sequentially from disk. Sourced from `ColumnStat::IsPhysicallyOrdered`
+    /// in the catalog. Defaults to `false` when stats are absent — every
+    /// optimization that consults this must fall back gracefully so queries
+    /// against unannotated tables stay correct.
+    pub is_physically_ordered: bool,
+    /// True when DensityStat == 1.0 — every value in this column is unique.
+    /// This is the catalog's signal that the column is a primary key (or
+    /// otherwise unique). Used by `estimate_op_size` to compute exact join
+    /// output cardinality (PK-FK joins emit at most one row per FK row).
+    /// Defaults to false — fall back to size-only estimates.
+    pub is_unique: bool,
+    /// `(min, max)` bounds when `RangeStat` is available. Used to compute
+    /// per-predicate selectivity in `estimate_op_size::Filter`. None means
+    /// fall back to the flat 0.1 selectivity heuristic.
+    pub range: Option<(Data, Data)>,
+    /// Number of distinct values from `CardinalityStat`. Used as denominator
+    /// for equality-predicate selectivity (`col = const` ≈ 1 / distinct).
+    pub distinct_count: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,10 +122,40 @@ impl Catalog {
                 );
             }
 
+            // Extract per-column stats we know how to consume. Each is
+            // None/false when stats are absent, so optimizations stay safe.
+            let mut is_physically_ordered = false;
+            let mut is_unique = false;
+            let mut range: Option<(Data, Data)> = None;
+            let mut distinct_count: Option<u64> = None;
+
+            if let Some(stats) = column_spec.stats.as_deref() {
+                for stat in stats {
+                    match stat {
+                        ColumnStat::IsPhysicallyOrdered => { is_physically_ordered = true; }
+                        ColumnStat::DensityStat(d) if (d.0 - 1.0).abs() < 1e-6 => {
+                            is_unique = true;
+                        }
+                        ColumnStat::DensityStat(_) => {}
+                        ColumnStat::RangeStat(r) => {
+                            range = Some((r.lower_bound.clone(), r.upper_bound.clone()));
+                        }
+                        ColumnStat::CardinalityStat(c) => {
+                            distinct_count = Some(c.0);
+                        }
+                        ColumnStat::HistogramStat(_) => {} // not yet consumed
+                    }
+                }
+            }
+
             let column_catalog = ColumnCatalog {
                 name: column_spec.column_name.clone(),
                 index: column_index,
                 data_type: column_spec.data_type.clone(),
+                is_physically_ordered,
+                is_unique,
+                range,
+                distinct_count,
             };
 
             column_name_to_index.insert(column_catalog.name.clone(), column_index);

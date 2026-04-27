@@ -30,8 +30,9 @@ pub fn decode_block(
         block_bytes[row_count_offset + 1],
     ]) as usize;
 
-    // Decode rows sequentially from byte 0
-    let mut rows = Vec::new();
+    // Pre-size to row_count so we don't grow-and-reallocate during the
+    // hot per-row push loop (typical block ≈ 60-200 rows).
+    let mut rows = Vec::with_capacity(row_count);
     let mut offset = 0;
 
     for i in 0..row_count {

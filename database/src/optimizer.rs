@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
+use common::Data;
 use common::query::{
     ComparisionOperator, ComparisionValue, CrossData, FilterData, JoinAlgorithm, JoinData,
     Predicate, ProjectData, QueryOp, SortData, SortSpec,
 };
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, ColumnCatalog};
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -32,7 +33,7 @@ fn bottom_up_pass(op: QueryOp, catalog: &Catalog) -> QueryOp {
     let op = merge_adjacent_filters(op);
     let op = push_filter_through_sort(op, catalog);
     let op = push_selections(op, catalog);
-    let op = eliminate_redundant_sort(op);
+    let op = eliminate_redundant_sort(op, catalog);
     select_join_algorithm(op, catalog)
 }
 
@@ -380,7 +381,7 @@ fn push_selections(op: QueryOp, catalog: &Catalog) -> QueryOp {
     build_join_tree(inputs, filter_data.predicates, catalog)
 }
 
-fn is_sorted_on(op: &QueryOp, specs: &[SortSpec]) -> bool {
+fn is_sorted_on(op: &QueryOp, specs: &[SortSpec], catalog: &Catalog) -> bool {
     match op {
         QueryOp::Sort(d) => {
             d.sort_specs.len() >= specs.len()
@@ -388,14 +389,33 @@ fn is_sorted_on(op: &QueryOp, specs: &[SortSpec]) -> bool {
                     req.column_name == has.column_name && req.ascending == has.ascending
                 })
         }
-        QueryOp::Filter(d) => is_sorted_on(&d.underlying, specs),
+        // Filter preserves the underlying row order, so we can see through it.
+        QueryOp::Filter(d) => is_sorted_on(&d.underlying, specs, catalog),
+        // Project preserves order too — see through any rename/narrow that
+        // wasn't introduced for sort purposes.
+        QueryOp::Project(d) => is_sorted_on(&d.underlying, specs, catalog),
+        // Cost-based: the scan is "sorted on" the requested specs when the
+        // catalog asserts (via `IsPhysicallyOrdered`) that EVERY requested
+        // column is in ascending physical order on disk. We require all-asc
+        // because per-column physical order on a multi-key sort can't tell
+        // us about secondary-key order within ties — only the per-column
+        // ordering bit. When the catalog has no stats, this returns false
+        // and we fall back to the existing behavior (run the Sort).
+        QueryOp::Scan(d) => {
+            let Some(table) = catalog.get_table(&d.table_id) else { return false; };
+            specs.iter().all(|req| {
+                req.ascending && table.get_column(&req.column_name)
+                    .map(|c| c.is_physically_ordered)
+                    .unwrap_or(false)
+            })
+        }
         _ => false,
     }
 }
 
-fn eliminate_redundant_sort(op: QueryOp) -> QueryOp {
+fn eliminate_redundant_sort(op: QueryOp, catalog: &Catalog) -> QueryOp {
     let QueryOp::Sort(d) = op else { return op; };
-    if is_sorted_on(&d.underlying, &d.sort_specs) {
+    if is_sorted_on(&d.underlying, &d.sort_specs, catalog) {
         *d.underlying
     } else {
         QueryOp::Sort(d)
@@ -610,17 +630,42 @@ pub fn estimate_op_size(op: &QueryOp, catalog: &Catalog) -> f64 {
         }
         QueryOp::Filter(d) => {
             let base = estimate_op_size(&d.underlying, catalog);
-            base * 0.1f64.powi(d.predicates.len() as i32)
+            // Per-predicate selectivity from catalog stats when available;
+            // fall back to a flat 0.1 per predicate when the column has
+            // no stats. Predicates are AND'd, so combined selectivity is
+            // the product (independence assumption).
+            let combined: f64 = d.predicates.iter()
+                .map(|p| predicate_selectivity(&d.underlying, p, catalog))
+                .product();
+            (base * combined).max(1.0)
         }
         QueryOp::Project(d) => estimate_op_size(&d.underlying, catalog),
         QueryOp::Sort(d)    => estimate_op_size(&d.underlying, catalog),
-        // Equi-join, PK-FK shape (the common TPC-H case): output cardinality
-        // ≈ the larger side's row count (each FK row matches exactly one PK
-        // row). Pessimistic for filtered joins, accurate enough for the
-        // greedy join-tree builder + the build/probe-side swap heuristic.
+        // Equi-join cardinality refinement:
+        //   * If either side's join key is unique (PK), output is the OTHER
+        //     side's row count exactly (each row on the FK side matches at
+        //     most one row on the PK side).
+        //   * Otherwise fall back to max(l, r) — the conservative pre-stats
+        //     estimate.
+        // PK detection comes from `ColumnCatalog::is_unique`, which is
+        // populated only when the catalog has `DensityStat == 1.0` for the
+        // column. Without stats this branch never fires.
         QueryOp::Join(d) => {
             let l = estimate_op_size(&d.left,  catalog);
             let r = estimate_op_size(&d.right, catalog);
+            for pred in &d.predicates {
+                if !matches!(pred.operator, ComparisionOperator::EQ) { continue; }
+                let ComparisionValue::Column(other) = &pred.value else { continue; };
+                let left_key  = find_column_stats(&d.left,  &pred.column_name, catalog)
+                    .or_else(|| find_column_stats(&d.left,  other, catalog));
+                let right_key = find_column_stats(&d.right, &pred.column_name, catalog)
+                    .or_else(|| find_column_stats(&d.right, other, catalog));
+                match (left_key, right_key) {
+                    (Some(lc), _) if lc.is_unique => return r,
+                    (_, Some(rc)) if rc.is_unique => return l,
+                    _ => {}
+                }
+            }
             l.max(r)
         }
         // Cartesian product.
@@ -629,6 +674,92 @@ pub fn estimate_op_size(op: &QueryOp, catalog: &Catalog) -> f64 {
             let r = estimate_op_size(&d.right, catalog);
             l * r
         }
+    }
+}
+
+/// Walk down `op` to find the catalog stats for `col_name`. Returns the
+/// first match found by depth-first search; for a column visible at the
+/// schema level the scan it originates from must be reachable.
+fn find_column_stats<'a>(
+    op: &QueryOp,
+    col_name: &str,
+    catalog: &'a Catalog,
+) -> Option<&'a ColumnCatalog> {
+    match op {
+        QueryOp::Scan(d) => catalog.get_table(&d.table_id)
+            .and_then(|t| t.get_column(col_name)),
+        QueryOp::Filter(d)  => find_column_stats(&d.underlying, col_name, catalog),
+        QueryOp::Project(d) => find_column_stats(&d.underlying, col_name, catalog),
+        QueryOp::Sort(d)    => find_column_stats(&d.underlying, col_name, catalog),
+        QueryOp::Cross(d)   => find_column_stats(&d.left, col_name, catalog)
+            .or_else(|| find_column_stats(&d.right, col_name, catalog)),
+        QueryOp::Join(d)    => find_column_stats(&d.left, col_name, catalog)
+            .or_else(|| find_column_stats(&d.right, col_name, catalog)),
+    }
+}
+
+/// Selectivity (fraction of rows surviving) for a single predicate. Uses
+/// catalog stats when available — but capped at the old flat-0.1 fallback,
+/// so stats can only ever make the planner think a filter is MORE selective
+/// (smaller estimate). When stats say a filter would be less selective than
+/// 0.1 (e.g. equality on a 5-value enum, or a wide range filter), we keep
+/// 0.1 — the same conservative estimate the planner used before stats. This
+/// guarantees the new estimator never disturbs a plan that was already good
+/// under the old, simpler model.
+fn predicate_selectivity(op: &QueryOp, pred: &Predicate, catalog: &Catalog) -> f64 {
+    const DEFAULT: f64 = 0.1;
+    let Some(col) = find_column_stats(op, &pred.column_name, catalog) else {
+        return DEFAULT;
+    };
+    use ComparisionOperator::*;
+    use ComparisionValue::*;
+    // col OP col: cross-column correlation, no easy estimate.
+    if matches!(pred.value, Column(_)) {
+        return DEFAULT;
+    }
+    let stats_estimate = match pred.operator {
+        EQ  => col.distinct_count.map(|n| (1.0 / n as f64).clamp(1e-6, 1.0)),
+        NE  => col.distinct_count.map(|n| (1.0 - 1.0 / n as f64).clamp(0.0, 1.0)),
+        LT | LTE | GT | GTE => range_selectivity(col, pred),
+    };
+    // Cap at DEFAULT so we never produce a *less-selective* estimate than
+    // the pre-stats fallback. Apply stats only when they tighten the bound.
+    stats_estimate.map(|s| s.min(DEFAULT)).unwrap_or(DEFAULT)
+}
+
+/// For numeric range filters: fraction of (max - min) the predicate accepts.
+/// Returns None for strings or missing range stats — caller falls back.
+fn range_selectivity(col: &ColumnCatalog, pred: &Predicate) -> Option<f64> {
+    let (lo, hi) = col.range.as_ref()?;
+    let l = data_to_f64(lo)?;
+    let h = data_to_f64(hi)?;
+    if h <= l { return None; }
+    let v = compvalue_to_f64(&pred.value)?;
+    let frac = match pred.operator {
+        ComparisionOperator::LT  | ComparisionOperator::LTE => (v - l) / (h - l),
+        ComparisionOperator::GT  | ComparisionOperator::GTE => (h - v) / (h - l),
+        _ => return None,
+    };
+    Some(frac.clamp(0.001, 1.0))
+}
+
+fn data_to_f64(d: &Data) -> Option<f64> {
+    match d {
+        Data::Int32(x)   => Some(*x as f64),
+        Data::Int64(x)   => Some(*x as f64),
+        Data::Float32(x) => Some(*x as f64),
+        Data::Float64(x) => Some(*x),
+        Data::String(_)  => None,
+    }
+}
+
+fn compvalue_to_f64(v: &ComparisionValue) -> Option<f64> {
+    match v {
+        ComparisionValue::I32(x)   => Some(*x as f64),
+        ComparisionValue::I64(x)   => Some(*x as f64),
+        ComparisionValue::F32(x)   => Some(*x as f64),
+        ComparisionValue::F64(x)   => Some(*x),
+        ComparisionValue::String(_) | ComparisionValue::Column(_) => None,
     }
 }
 
