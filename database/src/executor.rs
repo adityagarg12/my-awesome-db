@@ -960,13 +960,13 @@ struct PartitionBuffer {
 }
 
 impl PartitionBuffer {
-    fn new() -> Self { 
+    fn new() -> Self {
         Self {
             extents: Vec::new(),
-            block: Vec::new(),   // <--- 0 bytes
+            block: Vec::new(),
             block_off: 0,
             rows_in_block: 0,
-            pending: Vec::new(), // <--- 0 bytes
+            pending: Vec::new(),
             pending_blocks: 0,
         }
     }
