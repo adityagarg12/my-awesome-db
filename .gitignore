@@ -6,3 +6,5 @@
 **/*.bin
 **/*.sql
 *.gz
+CLAUDE.md
+submission.tar.xz

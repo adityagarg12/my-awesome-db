@@ -58,6 +58,21 @@ impl Row {
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
+
+    /// Approximate heap-backed memory held by this row instance.
+    ///
+    /// Includes the `Vec<Data>` backing storage and string payload capacities.
+    /// Used for conservative operator buffering decisions.
+    pub fn exact_mem_size(&self) -> usize {
+        let mut bytes = std::mem::size_of::<Self>();
+        bytes += self.values.capacity() * std::mem::size_of::<Data>();
+        for v in &self.values {
+            if let Data::String(s) = v {
+                bytes += s.capacity();
+            }
+        }
+        bytes
+    }
 }
 
 pub fn decode_row(
@@ -65,7 +80,8 @@ pub fn decode_row(
     offset: &mut usize,
     schema: &[ColumnCatalog],
 ) -> Result<Row> {
-    let mut values = Vec::new();
+    // Pre-size — we know the column count up-front; avoids per-push growth.
+    let mut values = Vec::with_capacity(schema.len());
 
     for column in schema {
         let (value, bytes_read) = decode_value(bytes, *offset, &column.data_type)
@@ -77,7 +93,29 @@ pub fn decode_row(
     Ok(Row { values })
 }
 
-fn decode_value(bytes: &[u8], offset: usize, data_type: &DataType) -> Result<(Data, usize)> {
+/// Skip one encoded value of `data_type` at `*offset` without decoding or allocating.
+pub fn skip_value_at(bytes: &[u8], offset: &mut usize, data_type: &DataType) -> Result<()> {
+    match data_type {
+        DataType::Int32 | DataType::Float32 => {
+            if *offset + 4 > bytes.len() { bail!("Not enough bytes to skip field"); }
+            *offset += 4;
+            Ok(())
+        }
+        DataType::Int64 | DataType::Float64 => {
+            if *offset + 8 > bytes.len() { bail!("Not enough bytes to skip field"); }
+            *offset += 8;
+            Ok(())
+        }
+        DataType::String => {
+            while *offset < bytes.len() && bytes[*offset] != 0 { *offset += 1; }
+            if *offset >= bytes.len() { bail!("String missing null terminator during skip"); }
+            *offset += 1;
+            Ok(())
+        }
+    }
+}
+
+pub fn decode_value(bytes: &[u8], offset: usize, data_type: &DataType) -> Result<(Data, usize)> {
     match data_type {
         DataType::Int32 => {
             if offset + 4 > bytes.len() {

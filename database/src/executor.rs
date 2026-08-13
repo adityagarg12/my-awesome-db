@@ -1,13 +1,128 @@
 use std::collections::{BinaryHeap, HashMap};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
+
+// ---------------------------------------------------------------------------
+// FNV-1a 64-bit hasher
+//
+// Tiny non-cryptographic hash used for grace-hash-join partitioning and the
+// build-side HashMap. ~3-4× faster than DefaultHasher (SipHash) on the short
+// composite keys we feed it (a few Ints/Strings) and avoids the per-hash
+// random-state allocation. No external dep required.
+// ---------------------------------------------------------------------------
+#[derive(Default, Clone)]
+struct FnvHasher { state: u64 }
+
+impl FnvHasher {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME:  u64 = 0x100000001b3;
+    fn new() -> Self { Self { state: Self::OFFSET } }
+}
+
+impl Hasher for FnvHasher {
+    #[inline]
+    fn finish(&self) -> u64 { self.state }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut s = self.state;
+        for &b in bytes {
+            s ^= b as u64;
+            s = s.wrapping_mul(Self::PRIME);
+        }
+        self.state = s;
+    }
+}
+
+type FnvHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FnvHasher>>;
+
+// ---------------------------------------------------------------------------
+// BloomFilter — used for sideways pushdown in HashJoinOperator.
+//
+// Built from build-side (left) join-key hashes during the left spill, then
+// queried per probe-side (right) row during the right spill so rows whose
+// key cannot possibly match any left key are dropped before encode/write.
+// Saves both writes (in this phase) and reads (in the probe phase) for any
+// selective join.
+//
+// Design:
+//  - Fixed-size bit array, capped in bytes — memory is bounded regardless
+//    of dataset cardinality. Falsely-positive lookups only cost a wasted
+//    spill+probe; never miss a true match.
+//  - Double-hashing trick: derive k bit positions from a single 64-bit key
+//    hash via h_i = h1 + i*h2, where h1 = key_hash and h2 = mix(key_hash).
+//    Avoids the cost of running the row through k independent hashers.
+//  - Word-granular bit array (Vec<u64>) for cache-friendly access.
+// ---------------------------------------------------------------------------
+struct BloomFilter {
+    bits: Vec<u64>,
+    num_bits: u64,
+    num_hashes: u32,
+}
+
+impl BloomFilter {
+    /// Allocate a filter sized to roughly `bits_per_element` bits per expected
+    /// key, capped at `max_bytes`. `expected_elements` may be a rough estimate;
+    /// past saturation the filter just degrades (higher FPR), still correct.
+    fn new(expected_elements: usize, max_bytes: usize) -> Self {
+        const BITS_PER_ELEMENT: usize = 10;
+        let target_bits = expected_elements.saturating_mul(BITS_PER_ELEMENT).max(64);
+        let cap_bits = max_bytes.saturating_mul(8).max(64);
+        let mut num_bits = target_bits.min(cap_bits);
+        // Round up to a multiple of 64 so we can index by whole words.
+        num_bits = num_bits.div_ceil(64) * 64;
+        let words = num_bits / 64;
+        Self {
+            bits: vec![0u64; words],
+            num_bits: num_bits as u64,
+            num_hashes: 7,
+        }
+    }
+
+    #[inline(always)]
+    fn positions(&self, key_hash: u64) -> (u64, u64) {
+        // h1 from the raw key hash; h2 from a cheap independent mix so the
+        // (h1, h2) probes don't stay correlated to the partition function
+        // (which uses key_hash % partition_count, the lowest bits).
+        let h1 = key_hash;
+        let h2 = key_hash.rotate_left(32) ^ 0x9E37_79B9_7F4A_7C15u64;
+        // Ensure h2 is odd so successive probes stay distinct mod even widths.
+        let h2 = h2 | 1;
+        (h1, h2)
+    }
+
+    fn insert(&mut self, key_hash: u64) {
+        let (h1, h2) = self.positions(key_hash);
+        let m = self.num_bits;
+        for i in 0..self.num_hashes as u64 {
+            let bit = h1.wrapping_add(i.wrapping_mul(h2)) % m;
+            let word = (bit >> 6) as usize;
+            let mask = 1u64 << (bit & 63);
+            self.bits[word] |= mask;
+        }
+    }
+
+    fn might_contain(&self, key_hash: u64) -> bool {
+        let (h1, h2) = self.positions(key_hash);
+        let m = self.num_bits;
+        for i in 0..self.num_hashes as u64 {
+            let bit = h1.wrapping_add(i.wrapping_mul(h2)) % m;
+            let word = (bit >> 6) as usize;
+            let mask = 1u64 << (bit & 63);
+            if (self.bits[word] & mask) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use anyhow::{Result, anyhow};
 use common::{Data, DataType};
-use common::query::{ComparisionOperator, ComparisionValue, JoinAlgorithm, JoinData, Predicate, QueryOp, SortSpec};
+use common::query::{ComparisionOperator, ComparisionValue, JoinAlgorithm, Predicate, QueryOp, SortSpec};
 use crate::catalog::{Catalog, ColumnCatalog, TableCatalog};
 use crate::disk_access::DiskAccessLayer;
 use crate::row::{Row, data_compare, encode_row};
-use crate::block_codec::{decode_block, encode_rows_to_blocks};
+use crate::block_codec::{decode_block, decode_block_projected};
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -47,21 +162,37 @@ impl Schema {
         self.columns.len()
     }
 
-    /// Concatenate two schemas (for Cross product).
+    /// Concatenate two schemas (for Cross product). Cross/Join shuffles row
+    /// order AND can duplicate values (each left row paired with many right
+    /// rows), so neither physical order nor uniqueness survive — strip both.
+    /// Range/distinct_count of base columns are still informative on the
+    /// merged schema (the SET of values doesn't change), so propagate those.
     pub fn merge(left: &Schema, right: &Schema) -> Self {
         let mut cols = Vec::with_capacity(left.len() + right.len());
         for (i, c) in left.columns.iter().enumerate() {
-            cols.push(ColumnCatalog { name: c.name.clone(), index: i, data_type: c.data_type.clone() });
+            cols.push(ColumnCatalog {
+                name: c.name.clone(), index: i, data_type: c.data_type.clone(),
+                is_physically_ordered: false,
+                is_unique: false,
+                range: c.range.clone(),
+                distinct_count: c.distinct_count,
+            });
         }
         let offset = left.len();
         for (i, c) in right.columns.iter().enumerate() {
-            cols.push(ColumnCatalog { name: c.name.clone(), index: offset + i, data_type: c.data_type.clone() });
+            cols.push(ColumnCatalog {
+                name: c.name.clone(), index: offset + i, data_type: c.data_type.clone(),
+                is_physically_ordered: false,
+                is_unique: false,
+                range: c.range.clone(),
+                distinct_count: c.distinct_count,
+            });
         }
         Self::new(cols)
     }
 
     /// Build the projected schema and return (projected_schema, src_indices).
-    /// `column_map` is [(from_name, to_name)].
+    /// Project preserves rows 1:1, so all per-column stats survive verbatim.
     pub fn project(input: &Schema, column_map: &[(String, String)]) -> Result<(Self, Vec<usize>)> {
         let mut cols = Vec::new();
         let mut src_indices = Vec::new();
@@ -69,7 +200,13 @@ impl Schema {
             let src_idx = input.get_index(from)
                 .ok_or_else(|| anyhow!("Column '{}' not found in schema", from))?;
             let src_col = &input.columns[src_idx];
-            cols.push(ColumnCatalog { name: to.clone(), index: i, data_type: src_col.data_type.clone() });
+            cols.push(ColumnCatalog {
+                name: to.clone(), index: i, data_type: src_col.data_type.clone(),
+                is_physically_ordered: src_col.is_physically_ordered,
+                is_unique: src_col.is_unique,
+                range: src_col.range.clone(),
+                distinct_count: src_col.distinct_count,
+            });
             src_indices.push(src_idx);
         }
         Ok((Self::new(cols), src_indices))
@@ -86,6 +223,67 @@ pub trait Operator {
     fn next(&mut self) -> Result<Option<Row>>;
 }
 
+// Number of blocks the ScanOperator fetches in a single disk command.
+// Also used by CrossOperator's right-side block loader (read_block_with_prefetch).
+// Matching PREFETCH_BLOCKS_PER_SCAN in main.rs so memory reservation stays accurate.
+const PREFETCH_SIZE: u64 = 64;
+
+// Blocks written per write_blocks IPC call in spill/merge paths.
+// 256 blocks × 4 KB = 1 MB write buffer — reduces IPC round trips while
+// keeping peak extra allocation small and independent of chunk/table size.
+const BATCH_BLOCKS: usize = 256;
+
+// Blocks fetched per read_blocks IPC call inside SegmentedRunReader.
+// Raw bytes are held in a prefetch buffer; only ONE block is decoded at a time.
+// 32 blocks = 128 KB per fetch: halves run-switch disk calls in k-way merge,
+// cutting non-sequential rotational-latency hits roughly in half.
+// fan_in scales inversely (per_run grows), so total merge memory is unchanged:
+//   fan_in = available / per_run  →  fan_in × per_run ≈ constant.
+// Must stay in sync with PREFETCH_BLOCKS_PER_SCAN in main.rs (same buffer pool).
+const RUN_PREFETCH_SIZE: u64 = 32;
+
+// Grace hash join parameters.
+const HASH_PARTITIONS: usize = 16;
+// Larger per-partition write batches reduce both write_blocks IPC count and
+// the cylinder-seek count per partition during read-back. 64 blocks = 256 KB
+// per write. Total pending RAM = HASH_PARTITIONS × 2 sides × 64 × block_size
+// ≈ 8 MB at 4 KB blocks (same as old 32×32 config) — well within the join's
+// memory budget (10 × per-operator), and unrelated to dataset size.
+const HASH_PARTITION_BATCH_BLOCKS: usize = 64;
+
+/// Encoded byte length of one row without allocating any buffer.
+/// Must stay in sync with encode_row / encode_value in row.rs.
+fn row_encoded_len(row: &Row, schema: &[ColumnCatalog]) -> usize {
+    row.values().iter().zip(schema.iter()).map(|(v, col)| {
+        match col.data_type {
+            DataType::Int32  | DataType::Float32 => 4,
+            DataType::Int64  | DataType::Float64 => 8,
+            DataType::String => match v {
+                Data::String(s) => s.len() + 1, // payload + null terminator
+                _               => 1,            // type mismatch; encode_row will error
+            },
+        }
+    }).sum()
+}
+
+/// Count the number of disk blocks needed to store `rows` without allocating
+/// an encoded buffer. Returns Err if any single row exceeds one block's capacity.
+fn count_run_blocks(rows: &[Row], schema: &[ColumnCatalog], block_size: usize) -> Result<u64> {
+    let usable = block_size - 2; // 2-byte row-count footer per block
+    let mut off = 0usize;
+    let mut cnt = 0u64;
+    for row in rows {
+        let len = row_encoded_len(row, schema);
+        if len > usable {
+            anyhow::bail!("row ({} B) exceeds usable block space ({} B)", len, usable);
+        }
+        if off + len > usable { cnt += 1; off = 0; }
+        off += len;
+    }
+    if off > 0 { cnt += 1; }
+    Ok(cnt)
+}
+
 // ---------------------------------------------------------------------------
 // Anonymous-block allocator (sparse disk scratch space)
 // ---------------------------------------------------------------------------
@@ -93,15 +291,75 @@ pub trait Operator {
 #[derive(Clone)]
 pub struct AnonBlockAllocator {
     next_block: Arc<Mutex<u64>>,
+    /// Freed (start, count) segments available for reuse.
+    free_list: Arc<Mutex<Vec<(u64, u64)>>>,
 }
 
 impl AnonBlockAllocator {
     pub fn new(start: u64) -> Self {
-        Self { next_block: Arc::new(Mutex::new(start)) }
+        Self {
+            next_block: Arc::new(Mutex::new(start)),
+            free_list: Arc::new(Mutex::new(Vec::new())),
+        }
     }
-    /// Atomically allocate `count` consecutive anonymous blocks.
+
+    /// Allocate `count` consecutive anonymous blocks, preferring the free list.
     /// Returns the starting block ID.
     pub fn allocate(&self, count: u64) -> u64 {
+        let mut free = self.free_list.lock().unwrap();
+        for i in 0..free.len() {
+            if free[i].1 == count {
+                let start = free[i].0;
+                free.swap_remove(i);
+                return start;
+            }
+            if free[i].1 > count {
+                let start = free[i].0;
+                free[i].0 += count;
+                free[i].1 -= count;
+                return start;
+            }
+        }
+        drop(free);
+        let mut next = self.next_block.lock().unwrap();
+        let start = *next;
+        *next += count;
+        start
+    }
+
+    /// Return `count` blocks starting at `start` to the free list for reuse.
+    pub fn free(&self, start: u64, count: u64) {
+        if count == 0 {
+            return;
+        }
+
+        let mut free = self.free_list.lock().unwrap();
+        free.push((start, count));
+        free.sort_unstable_by_key(|(s, _)| *s);
+
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(free.len());
+        for (seg_start, seg_count) in free.drain(..) {
+            let seg_end = seg_start.saturating_add(seg_count);
+            if let Some((last_start, last_count)) = merged.last_mut() {
+                let last_end = last_start.saturating_add(*last_count);
+                if seg_start <= last_end {
+                    let new_end = last_end.max(seg_end);
+                    *last_count = new_end.saturating_sub(*last_start);
+                    continue;
+                }
+            }
+            merged.push((seg_start, seg_count));
+        }
+
+        *free = merged;
+    }
+
+    /// Allocate `count` consecutive blocks from the sequential counter, ignoring
+    /// the free list.  Use this for streaming writes (where total size is unknown
+    /// upfront and blocks are allocated in multiple BATCH_BLOCKS-sized calls).
+    /// Guarantees that consecutive calls return truly consecutive block IDs, so
+    /// RunReader can read them back as a single contiguous range.
+    pub fn allocate_sequential(&self, count: u64) -> u64 {
         let mut next = self.next_block.lock().unwrap();
         let start = *next;
         *next += count;
@@ -116,12 +374,24 @@ impl AnonBlockAllocator {
 pub struct ScanOperator<R: Read, W: Write> {
     disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
     schema: Schema,
+    /// Full table column list used by the projected decode path.
+    /// Empty when decoding all columns (non-projected path).
+    all_columns: Vec<ColumnCatalog>,
+    /// Sorted column indices to decode; empty = decode all (use schema directly).
+    needed_indices: Vec<usize>,
     file_id: String,
     block_size: u64,
     // Populated on first next()
     start_block: u64,
     num_blocks: u64,
-    current_block_offset: u64,
+    /// Offset of the next block to fetch from disk (advances by PREFETCH_SIZE).
+    next_block_to_fetch: u64,
+    /// Raw bytes of the most recently prefetched batch (up to PREFETCH_SIZE blocks).
+    prefetch_buf: Vec<u8>,
+    /// How many blocks are currently in prefetch_buf.
+    prefetch_count: u64,
+    /// Which block within prefetch_buf to decode next (0-based).
+    prefetch_idx: u64,
     current_rows: Vec<Row>,
     current_row_idx: usize,
     initialized: bool,
@@ -136,15 +406,82 @@ impl<R: Read, W: Write> ScanOperator<R, W> {
         ScanOperator {
             disk_access,
             schema: Schema::from_table(table),
+            all_columns: Vec::new(),
+            needed_indices: Vec::new(),
             file_id: table.file_id.clone(),
             block_size,
             start_block: 0,
             num_blocks: 0,
-            current_block_offset: 0,
+            next_block_to_fetch: 0,
+            prefetch_buf: Vec::new(),
+            prefetch_count: 0,
+            prefetch_idx: 0,
             current_rows: Vec::new(),
             current_row_idx: 0,
             initialized: false,
         }
+    }
+
+    /// Build a scan that decodes only the columns named in `needed_col_names`.
+    /// The output schema lists those columns in table order (sorted by original index).
+    pub fn new_projected(
+        disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
+        table: &TableCatalog,
+        block_size: u64,
+        needed_col_names: &[String],
+    ) -> Result<Self> {
+        let all_columns = table.columns().to_vec();
+        let name_to_idx: HashMap<&str, usize> = all_columns.iter()
+            .enumerate()
+            .map(|(i, c)| (c.name.as_str(), i))
+            .collect();
+
+        let mut needed_indices: Vec<usize> = Vec::with_capacity(needed_col_names.len());
+        for n in needed_col_names {
+            let idx = name_to_idx.get(n.as_str()).copied()
+                .ok_or_else(|| anyhow!(
+                    "ScanOperator::new_projected: column '{}' not found in table '{}'",
+                    n, table.name
+                ))?;
+            needed_indices.push(idx);
+        }
+        needed_indices.sort_unstable();
+        needed_indices.dedup();
+
+        // Build narrowed schema in table order. Scan preserves physical
+        // order on each retained column (we just skip the unwanted ones
+        // during decode — row order is unchanged), so all per-column stats
+        // survive intact.
+        let narrow_columns: Vec<ColumnCatalog> = needed_indices.iter()
+            .enumerate()
+            .map(|(new_idx, &old_idx)| ColumnCatalog {
+                name: all_columns[old_idx].name.clone(),
+                index: new_idx,
+                data_type: all_columns[old_idx].data_type.clone(),
+                is_physically_ordered: all_columns[old_idx].is_physically_ordered,
+                is_unique: all_columns[old_idx].is_unique,
+                range: all_columns[old_idx].range.clone(),
+                distinct_count: all_columns[old_idx].distinct_count,
+            })
+            .collect();
+
+        Ok(ScanOperator {
+            disk_access,
+            schema: Schema::new(narrow_columns),
+            all_columns,
+            needed_indices,
+            file_id: table.file_id.clone(),
+            block_size,
+            start_block: 0,
+            num_blocks: 0,
+            next_block_to_fetch: 0,
+            prefetch_buf: Vec::new(),
+            prefetch_count: 0,
+            prefetch_idx: 0,
+            current_rows: Vec::new(),
+            current_row_idx: 0,
+            initialized: false,
+        })
     }
 
     fn initialize(&mut self) -> Result<()> {
@@ -155,20 +492,41 @@ impl<R: Read, W: Write> ScanOperator<R, W> {
         Ok(())
     }
 
-    /// Load the next block from disk into `current_rows`. Returns false when
-    /// all blocks have been read.
+    /// Decode the next block, prefetching PREFETCH_SIZE blocks at a time via a
+    /// single disk command.  Returns false when the file is exhausted.
     fn load_next_block(&mut self) -> Result<bool> {
-        if self.current_block_offset >= self.num_blocks {
-            return Ok(false);
+        // Refill the prefetch buffer when it is exhausted.
+        if self.prefetch_idx >= self.prefetch_count {
+            if self.next_block_to_fetch >= self.num_blocks {
+                return Ok(false);
+            }
+            let remaining = self.num_blocks - self.next_block_to_fetch;
+            let fetch_count = remaining.min(PREFETCH_SIZE);
+            let start_id = self.start_block + self.next_block_to_fetch;
+            // One disk command reads up to 16 blocks; they are also inserted
+            // into the shared buffer pool cache inside read_blocks().
+            self.prefetch_buf = {
+                let mut disk = self.disk_access.lock().unwrap();
+                disk.read_blocks(start_id, fetch_count)?
+            };
+            self.prefetch_count = fetch_count;
+            self.prefetch_idx = 0;
+            self.next_block_to_fetch += fetch_count;
         }
-        let block_id = self.start_block + self.current_block_offset;
-        let block_data = {
-            let mut disk = self.disk_access.lock().unwrap();
-            disk.read_blocks(block_id, 1)?
+
+        // Decode the next block from the in-hand prefetch buffer.
+        let offset = (self.prefetch_idx * self.block_size) as usize;
+        let rows = {
+            let block_slice = &self.prefetch_buf[offset..offset + self.block_size as usize];
+            if self.needed_indices.is_empty() {
+                decode_block(block_slice, self.block_size, self.schema.columns())?
+            } else {
+                decode_block_projected(block_slice, self.block_size, &self.all_columns, &self.needed_indices)?
+            }
         };
-        self.current_rows = decode_block(&block_data, self.block_size, self.schema.columns())?;
+        self.current_rows = rows;
         self.current_row_idx = 0;
-        self.current_block_offset += 1;
+        self.prefetch_idx += 1;
         Ok(true)
     }
 }
@@ -194,48 +552,70 @@ impl<R: Read, W: Write> Operator for ScanOperator<R, W> {
 }
 
 // ---------------------------------------------------------------------------
+// Compiled predicates
+// ---------------------------------------------------------------------------
+
+enum CompiledValue {
+    Column(usize),
+    Literal(Data),
+}
+
+struct CompiledPredicate {
+    left_idx: usize,
+    operator: ComparisionOperator,
+    right_val: CompiledValue,
+}
+
+fn compile_predicates(predicates: &[Predicate], schema: &Schema) -> Vec<CompiledPredicate> {
+    predicates.iter().filter_map(|pred| {
+        let left_idx = schema.get_index(&pred.column_name)?;
+        let right_val = match &pred.value {
+            ComparisionValue::Column(name) => CompiledValue::Column(schema.get_index(name)?),
+            ComparisionValue::I32(v)       => CompiledValue::Literal(Data::Int32(*v)),
+            ComparisionValue::I64(v)       => CompiledValue::Literal(Data::Int64(*v)),
+            ComparisionValue::F32(v)       => CompiledValue::Literal(Data::Float32(*v)),
+            ComparisionValue::F64(v)       => CompiledValue::Literal(Data::Float64(*v)),
+            ComparisionValue::String(v)    => CompiledValue::Literal(Data::String(v.clone())),
+        };
+        Some(CompiledPredicate { left_idx, operator: pred.operator.clone(), right_val })
+    }).collect()
+}
+
+fn eval_compiled_predicates(preds: &[CompiledPredicate], row: &Row) -> Result<bool> {
+    for pred in preds {
+        let left_val = row.get(pred.left_idx)
+            .ok_or_else(|| anyhow!("row missing value at index {}", pred.left_idx))?;
+        let right_val = match &pred.right_val {
+            CompiledValue::Column(idx) => row.get(*idx)
+                .ok_or_else(|| anyhow!("row missing value at index {}", idx))?,
+            CompiledValue::Literal(val) => val,
+        };
+        if !data_compare(left_val, right_val, &pred.operator)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
 // FilterOperator
 // ---------------------------------------------------------------------------
 
 pub struct FilterOperator {
     child: Box<dyn Operator>,
-    predicates: Vec<Predicate>,
+    compiled_preds: Vec<CompiledPredicate>,
     schema: Schema,
 }
 
 impl FilterOperator {
     pub fn new(child: Box<dyn Operator>, predicates: Vec<Predicate>) -> Self {
         let schema = child.schema().clone();
-        FilterOperator { child, predicates, schema }
+        let compiled_preds = compile_predicates(&predicates, &schema);
+        FilterOperator { child, compiled_preds, schema }
     }
 
     fn row_passes(&self, row: &Row) -> Result<bool> {
-        for pred in &self.predicates {
-            let col_idx = self.schema.get_index(&pred.column_name)
-                .ok_or_else(|| anyhow!("Filter: column '{}' not found", pred.column_name))?;
-            let left_val = row.get(col_idx)
-                .ok_or_else(|| anyhow!("Filter: row has no value at index {}", col_idx))?;
-
-            let right_val: Data = match &pred.value {
-                ComparisionValue::Column(name) => {
-                    let idx = self.schema.get_index(name)
-                        .ok_or_else(|| anyhow!("Filter: column '{}' not found", name))?;
-                    row.get(idx)
-                        .ok_or_else(|| anyhow!("Filter: row has no value at index {}", idx))?
-                        .clone()
-                }
-                ComparisionValue::I32(v)    => Data::Int32(*v),
-                ComparisionValue::I64(v)    => Data::Int64(*v),
-                ComparisionValue::F32(v)    => Data::Float32(*v),
-                ComparisionValue::F64(v)    => Data::Float64(*v),
-                ComparisionValue::String(v) => Data::String(v.clone()),
-            };
-
-            if !data_compare(left_val, &right_val, &pred.operator)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        eval_compiled_predicates(&self.compiled_preds, row)
     }
 }
 
@@ -317,18 +697,19 @@ pub struct CrossOperator<R: Read, W: Write> {
     anon_allocator: AnonBlockAllocator,
     right_cols: Vec<ColumnCatalog>,
     memory_limit_bytes: u64,
-    /// Join predicates pushed down from a parent Filter.
+    /// Compiled join predicates (indices pre-resolved at construction).
     /// Empty = pure cartesian product; non-empty = B-NLJ join.
-    predicates: Vec<Predicate>,
+    compiled_preds: Vec<CompiledPredicate>,
 
     // Populated after spill
     initialized: bool,
     right_is_empty: bool,
-    right_start_block: u64,
     right_num_blocks: u64,
+    right_extents: Vec<(u64, u64)>,
 
     // B-NLJ iteration state
     left_chunk: Vec<Row>,           // buffered left rows for current outer pass
+    left_next_row: Option<Row>,     // row that didn't fit current chunk budget
     left_exhausted: bool,
     right_block_offset: u64,        // which right block (0-based) we are scanning
     right_block_rows: Vec<Row>,     // decoded rows from current right block
@@ -348,13 +729,16 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
     ) -> Self {
         let schema     = Schema::merge(left.schema(), right.schema());
         let right_cols = right.schema().columns().to_vec();
+        let compiled_preds = compile_predicates(&predicates, &schema);
         CrossOperator {
             left, right: Some(right), schema,
             disk_access, block_size, anon_allocator, right_cols,
-            memory_limit_bytes, predicates,
+            memory_limit_bytes, compiled_preds,
             initialized: false, right_is_empty: false,
-            right_start_block: 0, right_num_blocks: 0,
+            right_num_blocks: 0,
+            right_extents: Vec::new(),
             left_chunk: Vec::new(), left_exhausted: false,
+            left_next_row: None,
             right_block_offset: 0,
             right_block_rows: Vec::new(),
             right_row_idx: 0, left_chunk_idx: 0,
@@ -363,83 +747,45 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
 
     /// Check all predicates against the merged row. Empty predicates → always true.
     fn row_passes(&self, row: &Row) -> Result<bool> {
-        for pred in &self.predicates {
-            let col_idx = self.schema.get_index(&pred.column_name)
-                .ok_or_else(|| anyhow!("CrossOperator: column '{}' not found", pred.column_name))?;
-            let left_val = row.get(col_idx)
-                .ok_or_else(|| anyhow!("CrossOperator: row missing value at index {}", col_idx))?;
-            let right_val: Data = match &pred.value {
-                ComparisionValue::Column(name) => {
-                    let idx = self.schema.get_index(name)
-                        .ok_or_else(|| anyhow!("CrossOperator: column '{}' not found", name))?;
-                    row.get(idx)
-                        .ok_or_else(|| anyhow!("CrossOperator: row missing value at index {}", idx))?
-                        .clone()
-                }
-                ComparisionValue::I32(v)    => Data::Int32(*v),
-                ComparisionValue::I64(v)    => Data::Int64(*v),
-                ComparisionValue::F32(v)    => Data::Float32(*v),
-                ComparisionValue::F64(v)    => Data::Float64(*v),
-                ComparisionValue::String(v) => Data::String(v.clone()),
-            };
-            if !data_compare(left_val, &right_val, &pred.operator)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        eval_compiled_predicates(&self.compiled_preds, row)
     }
 
-    /// Estimate in-memory size of one left row (same logic as SortOperator).
-    fn left_row_size(&self) -> usize {
-        let mut s = 24usize;
-        for col in self.left.schema().columns() {
-            s += match col.data_type { DataType::String => 64, _ => 32 };
-        }
-        s
-    }
-
-    /// How many left rows to buffer per chunk.
+    /// Byte budget for the left chunk.
     ///
     /// Unlike SortOperator there is no double-allocation proportional to
     /// chunk size: the right spill uses a fixed block_buf (~4 KB) that is
     /// freed before B-NLJ begins, and the B-NLJ phase only holds the left
     /// chunk + one decoded right block simultaneously.
     ///
-    /// Process overhead (release binary ~12 MB, debug ~14 MB):
-    ///   text + data      : ~1.2 MB release / 2.7 MB debug
-    ///   shared libs      : ~2.5 MB (libc, libgcc)
-    ///   stack reservation: ~8 MB  (Linux default)
-    ///   heap metadata    : ~0.5 MB
-    ///   right block buf  : 4 × block_size (~16 KB, negligible)
-    ///
-    /// Reserve 16 MB for all overhead; give everything else to the left chunk.
-    /// 64 MB limit  → 48 MB available (75 %)
-    /// 256 MB limit → 240 MB available (94 %)
+    /// `memory_limit_bytes` is already a per-operator budget from main.rs.
+    /// Reserve right-side decode buffers and keep conservative headroom.
     /// 
-    fn left_chunk_capacity(&self) -> usize {
-        // TO BE CHECK , we can adjust the PROCESS_OVERHEAD estimate if needed based on actual measurements, which came around 14mb at startup in debug mode and 12mb in release mode. We want to be conservative to avoid OOM, but not too much to underutilize memory.
-        const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024; // 32 MB
+    fn left_chunk_budget_bytes(&self) -> usize {
+        // Reserve one decoded right block (read_block_with_prefetch) + small extras.
         let right_buf = self.block_size * 4;
-        let available = self.memory_limit_bytes
-            .saturating_sub(PROCESS_OVERHEAD)
+        let usable = self.memory_limit_bytes
             .saturating_sub(right_buf);
-        (available as usize / self.left_row_size()).max(64)
+        // Headroom for temporary join rows and per-loop allocations.
+        ((usable as usize) * 70 / 100).max(1)
     }
 
     // ------------------------------------------------------------------
-    // Phase 1: spill right to anonymous disk, one block at a time
+    // Phase 1: spill right to anonymous disk in BATCH_BLOCKS batches
     // ------------------------------------------------------------------
     fn spill_right(&mut self) -> Result<()> {
         let mut right_child = self.right.take().unwrap();
-        let usable = self.block_size as usize - 2;
+        let bs     = self.block_size as usize;
+        let usable = bs - 2;
 
-        let mut block_buf      = vec![0u8; self.block_size as usize];
-        let mut buf_offset     = 0usize;
-        let mut rows_in_block  = 0u16;
-        let mut total_blocks   = 0u64;
-        let mut first_block    = 0u64;
-        let mut got_first      = false;
-        let mut has_any_row    = false;
+        let batch_bytes = BATCH_BLOCKS * bs;
+        let mut batch        = vec![0u8; batch_bytes];
+        let mut in_batch     = 0usize;
+        let mut total_blocks = 0u64;
+        let mut has_any_row  = false;
+
+        let mut block        = vec![0u8; bs];
+        let mut blk_off      = 0usize;
+        let mut rows_blk     = 0u16;
 
         while let Some(row) = right_child.next()? {
             has_any_row = true;
@@ -451,20 +797,24 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
                 );
             }
 
-            if buf_offset + encoded.len() > usable {
-                // Flush current block to disk
-                let footer = block_buf.len() - 2;
-                block_buf[footer..].copy_from_slice(&rows_in_block.to_le_bytes());
-                let id = self.anon_allocator.allocate(1);
-                if !got_first { first_block = id; got_first = true; }
-                self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
-                total_blocks += 1;
-                block_buf.fill(0); buf_offset = 0; rows_in_block = 0;
+            if blk_off + encoded.len() > usable {
+                let footer = block.len() - 2;
+                block[footer..].copy_from_slice(&rows_blk.to_le_bytes());
+                batch[in_batch * bs..(in_batch + 1) * bs].copy_from_slice(&block);
+                block.fill(0); blk_off = 0; rows_blk = 0;
+                in_batch += 1;
+                if in_batch == BATCH_BLOCKS {
+                    let n  = in_batch as u64;
+                    let id = self.anon_allocator.allocate(n);
+                    push_extent(&mut self.right_extents, id, n);
+                    self.disk_access.lock().unwrap().write_blocks(id, n, &batch)?;
+                    total_blocks += n; in_batch = 0;
+                }
             }
 
-            block_buf[buf_offset..buf_offset + encoded.len()].copy_from_slice(&encoded);
-            buf_offset    += encoded.len();
-            rows_in_block += 1;
+            block[blk_off..blk_off + encoded.len()].copy_from_slice(&encoded);
+            blk_off  += encoded.len();
+            rows_blk += 1;
         }
 
         if !has_any_row {
@@ -472,15 +822,21 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
             return Ok(());
         }
 
-        // Flush the final (possibly partial) block
-        let footer = block_buf.len() - 2;
-        block_buf[footer..].copy_from_slice(&rows_in_block.to_le_bytes());
-        let id = self.anon_allocator.allocate(1);
-        if !got_first { first_block = id; }
-        self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
-        total_blocks += 1;
+        // Seal and flush the final partial block + remaining batch.
+        if rows_blk > 0 {
+            let footer = block.len() - 2;
+            block[footer..].copy_from_slice(&rows_blk.to_le_bytes());
+            batch[in_batch * bs..(in_batch + 1) * bs].copy_from_slice(&block);
+            in_batch += 1;
+        }
+        if in_batch > 0 {
+            let n  = in_batch as u64;
+            let id = self.anon_allocator.allocate(n);
+            push_extent(&mut self.right_extents, id, n);
+            self.disk_access.lock().unwrap().write_blocks(id, n, &batch[..in_batch * bs])?;
+            total_blocks += n;
+        }
 
-        self.right_start_block = first_block;
         self.right_num_blocks  = total_blocks;
         Ok(())
     }
@@ -489,13 +845,29 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
     // Phase 2 helpers
     // ------------------------------------------------------------------
 
-    /// Fill left_chunk with up to left_chunk_capacity rows from the left child.
+    /// Fill left_chunk while staying under the byte budget.
     fn fill_left_chunk(&mut self) -> Result<()> {
         self.left_chunk.clear();
-        let cap = self.left_chunk_capacity();
-        while self.left_chunk.len() < cap {
+        let budget = self.left_chunk_budget_bytes();
+        let mut used = 0usize;
+
+        if let Some(row) = self.left_next_row.take() {
+            let sz = row.exact_mem_size();
+            used = used.saturating_add(sz);
+            self.left_chunk.push(row);
+        }
+
+        loop {
             match self.left.next()? {
-                Some(row) => self.left_chunk.push(row),
+                Some(row) => {
+                    let sz = row.exact_mem_size();
+                    if !self.left_chunk.is_empty() && used.saturating_add(sz) > budget {
+                        self.left_next_row = Some(row);
+                        break;
+                    }
+                    used = used.saturating_add(sz);
+                    self.left_chunk.push(row);
+                }
                 None      => { self.left_exhausted = true; break; }
             }
         }
@@ -504,8 +876,20 @@ impl<R: Read, W: Write> CrossOperator<R, W> {
 
     /// Load right block at `offset` into right_block_rows; reset right_row_idx.
     fn load_right_block(&mut self, offset: u64) -> Result<()> {
-        let id   = self.right_start_block + offset;
-        let data = { self.disk_access.lock().unwrap().read_blocks(id, 1)? };
+        let mut logical = offset;
+        let mut id = None;
+        let mut remaining_in_extent = 0u64;
+        for (start, len) in &self.right_extents {
+            if logical < *len {
+                id = Some(*start + logical);
+                remaining_in_extent = *len - logical;
+                break;
+            }
+            logical -= *len;
+        }
+        let id = id.ok_or_else(|| anyhow!("CrossOperator: right block offset {} out of range", offset))?;
+        let prefetch = remaining_in_extent.min(PREFETCH_SIZE).max(1);
+        let data = { self.disk_access.lock().unwrap().read_block_with_prefetch(id, prefetch)? };
         self.right_block_rows = decode_block(&data, self.block_size, &self.right_cols)?;
         self.right_row_idx    = 0;
         Ok(())
@@ -581,6 +965,709 @@ impl<R: Read, W: Write> Operator for CrossOperator<R, W> {
     }
 }
 
+impl<R: Read, W: Write> Drop for CrossOperator<R, W> {
+    fn drop(&mut self) {
+        for (start, count) in self.right_extents.drain(..) {
+            self.anon_allocator.free(start, count);
+        }
+        self.right_num_blocks = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HashJoinOperator  — Grace Hash Join for equi-joins
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct PartitionBuffer {
+    extents: Vec<(u64, u64)>,
+    block: Vec<u8>,
+    block_off: usize,
+    rows_in_block: u16,
+    pending: Vec<u8>,
+    pending_blocks: usize,
+}
+
+impl PartitionBuffer {
+    fn new() -> Self {
+        Self {
+            extents: Vec::new(),
+            block: Vec::new(),
+            block_off: 0,
+            rows_in_block: 0,
+            pending: Vec::new(),
+            pending_blocks: 0,
+        }
+    }
+}
+
+pub struct HashJoinOperator<R: Read, W: Write> {
+    left: Option<Box<dyn Operator>>,
+    right: Option<Box<dyn Operator>>,
+    schema: Schema,
+    left_cols: Vec<ColumnCatalog>,
+    right_cols: Vec<ColumnCatalog>,
+    left_key_idx: Vec<usize>,
+    right_key_idx: Vec<usize>,
+    memory_limit_bytes: u64,
+    disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
+    block_size: u64,
+    anon_allocator: AnonBlockAllocator,
+    partition_count: usize,
+
+    initialized: bool,
+    done: bool,
+    left_partitions: Vec<PartitionBuffer>,
+    right_partitions: Vec<PartitionBuffer>,
+
+    probe_partition_idx: usize,
+    left_hash: FnvHashMap<Vec<Data>, Vec<Row>>,
+    /// Set during left-spill: entry `i` is true if left partition `i` has at
+    /// least one row written. Used to drop right rows whose partition has no
+    /// left counterpart — eliminates wasted writes (and the corresponding
+    /// future reads / cylinder seeks) for non-matching partitions.
+    non_empty_left: Vec<bool>,
+    /// Built during left-spill, queried during right-spill: a Bloom filter
+    /// over left join-key hashes. A right row whose key isn't in the filter
+    /// can never join, so we skip its encode + write entirely. Finer-grained
+    /// than `non_empty_left` (per-row vs per-partition).
+    left_bloom: Option<BloomFilter>,
+    current_right_reader: Option<SegmentedRunReader<R, W>>,
+    current_right_extents: Vec<(u64, u64)>,
+    current_right_row: Option<Row>,
+    current_left_matches: Vec<Row>,
+    current_left_match_idx: usize,
+    /// Hybrid-HJ flag: when true, the build (left) side fully fit in RAM, so
+    /// we skipped all left/right partition spills. `left_hash` holds the full
+    /// build, `right` (still in `self.right`) is streamed directly during probe.
+    /// When false, we are in classic grace mode (partitioned spill on disk).
+    inmem_mode: bool,
+}
+
+impl<R: Read, W: Write> HashJoinOperator<R, W> {
+    pub fn new(
+        left: Box<dyn Operator>,
+        right: Box<dyn Operator>,
+        disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
+        block_size: u64,
+        memory_limit_bytes: u64,
+        anon_allocator: AnonBlockAllocator,
+        predicates: Vec<Predicate>,
+    ) -> Result<Self> {
+        let schema = Schema::merge(left.schema(), right.schema());
+        let left_cols = left.schema().columns().to_vec();
+        let right_cols = right.schema().columns().to_vec();
+
+        let mut left_key_idx = Vec::new();
+        let mut right_key_idx = Vec::new();
+
+        for pred in &predicates {
+            if !matches!(pred.operator, ComparisionOperator::EQ) {
+                continue;
+            }
+            let other_col = match &pred.value {
+                ComparisionValue::Column(c) => c,
+                _ => continue,
+            };
+
+            let lk = left.schema().get_index(&pred.column_name);
+            let rk = right.schema().get_index(other_col);
+            if let (Some(li), Some(ri)) = (lk, rk) {
+                left_key_idx.push(li);
+                right_key_idx.push(ri);
+                continue;
+            }
+
+            let lk = left.schema().get_index(other_col);
+            let rk = right.schema().get_index(&pred.column_name);
+            if let (Some(li), Some(ri)) = (lk, rk) {
+                left_key_idx.push(li);
+                right_key_idx.push(ri);
+            }
+        }
+
+        if left_key_idx.is_empty() {
+            anyhow::bail!("HashJoin: no equi-join predicates found");
+        }
+
+        let partition_count = HASH_PARTITIONS;
+        let left_partitions = (0..partition_count)
+            .map(|_| PartitionBuffer::new())
+            .collect();
+        let right_partitions = (0..partition_count)
+            .map(|_| PartitionBuffer::new())
+            .collect();
+
+        Ok(Self {
+            left: Some(left),
+            right: Some(right),
+            schema,
+            left_cols,
+            right_cols,
+            left_key_idx,
+            right_key_idx,
+            memory_limit_bytes,
+            disk_access,
+            block_size,
+            anon_allocator,
+            partition_count,
+            initialized: false,
+            done: false,
+            left_partitions,
+            right_partitions,
+            probe_partition_idx: 0,
+            left_hash: FnvHashMap::default(),
+            non_empty_left: vec![false; partition_count],
+            left_bloom: None,
+            current_right_reader: None,
+            current_right_extents: Vec::new(),
+            current_right_row: None,
+            current_left_matches: Vec::new(),
+            current_left_match_idx: 0,
+            inmem_mode: false,
+        })
+    }
+
+    fn row_key(row: &Row, key_indices: &[usize]) -> Vec<Data> {
+        key_indices.iter()
+            .map(|&idx| row.get(idx).cloned().unwrap_or(Data::Int32(0)))
+            .collect()
+    }
+
+    /// Single FNV-1a hash of the row's join-key fields. Reused for both
+    /// partition selection and Bloom filter probing — one hash, two uses.
+    #[inline]
+    fn key_hash_64(row: &Row, key_indices: &[usize]) -> u64 {
+        let mut hasher = FnvHasher::new();
+        for &idx in key_indices {
+            if let Some(v) = row.get(idx) {
+                v.hash(&mut hasher);
+            } else {
+                Data::Int32(0).hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+
+    #[inline]
+    fn partition_for_row(row: &Row, key_indices: &[usize], partition_count: usize) -> usize {
+        (Self::key_hash_64(row, key_indices) as usize) % partition_count
+    }
+
+    fn append_encoded_row(
+        block_size: u64,
+        disk_access: &Arc<Mutex<DiskAccessLayer<R, W>>>,
+        anon_allocator: &AnonBlockAllocator,
+        partition: &mut PartitionBuffer,
+        encoded: &[u8],
+    ) -> Result<()> {
+
+        // LAZY ALLOCATION: Only allocate physical memory the very first time 
+        // a row is actually routed to this specific partition!
+        // This prevents the AST builder from pre-allocating 67MB of empty buffers.
+        if partition.block.is_empty() {
+            partition.block = vec![0u8; block_size as usize];
+            partition.pending = vec![0u8; HASH_PARTITION_BATCH_BLOCKS * block_size as usize];
+        }
+
+        let usable = block_size as usize - 2;
+        if partition.block_off + encoded.len() > usable {
+            Self::flush_partition_block(block_size, disk_access, anon_allocator, partition)?;
+        }
+
+        partition.block[partition.block_off..partition.block_off + encoded.len()]
+            .copy_from_slice(encoded);
+        partition.block_off += encoded.len();
+        partition.rows_in_block += 1;
+        Ok(())
+    }
+
+    fn flush_partition_block(
+        block_size: u64,
+        disk_access: &Arc<Mutex<DiskAccessLayer<R, W>>>,
+        anon_allocator: &AnonBlockAllocator,
+        partition: &mut PartitionBuffer,
+    ) -> Result<()> {
+        if partition.rows_in_block == 0 || partition.block.is_empty() {
+            return Ok(());
+        }
+
+        let bs = block_size as usize;
+        let footer = partition.block.len() - 2;
+        partition.block[footer..].copy_from_slice(&partition.rows_in_block.to_le_bytes());
+
+        let offset = partition.pending_blocks * bs;
+        partition.pending[offset..offset + bs].copy_from_slice(&partition.block);
+        partition.block.fill(0);
+        partition.block_off = 0;
+        partition.rows_in_block = 0;
+        partition.pending_blocks += 1;
+
+        if partition.pending_blocks == HASH_PARTITION_BATCH_BLOCKS {
+            let n = partition.pending_blocks as u64;
+            let start = anon_allocator.allocate_sequential(n);
+            push_extent(&mut partition.extents, start, n);
+            disk_access.lock().unwrap().write_blocks(start, n, &partition.pending[..n as usize * bs])?;
+            partition.pending_blocks = 0;
+        }
+
+        Ok(())
+    }
+
+    fn flush_partition_pending(
+        block_size: u64,
+        disk_access: &Arc<Mutex<DiskAccessLayer<R, W>>>,
+        anon_allocator: &AnonBlockAllocator,
+        partition: &mut PartitionBuffer,
+    ) -> Result<()> {
+        if partition.pending_blocks == 0 || partition.pending.is_empty() { return Ok(()); }
+
+        let bs = block_size as usize;
+        let n = partition.pending_blocks as u64;
+        let start = anon_allocator.allocate_sequential(n);
+        push_extent(&mut partition.extents, start, n);
+        disk_access.lock().unwrap().write_blocks(start, n, &partition.pending[..n as usize * bs])?;
+        partition.pending_blocks = 0;
+        Ok(())
+    }
+
+    fn spill_side(
+        block_size: u64,
+        partition_count: usize,
+        disk_access: &Arc<Mutex<DiskAccessLayer<R, W>>>,
+        anon_allocator: &AnonBlockAllocator,
+        child: &mut Box<dyn Operator>,
+        partitions: &mut [PartitionBuffer],
+        cols: &[ColumnCatalog],
+        key_indices: &[usize],
+        // If Some(mask), rows whose target partition has mask[idx] == false
+        // are dropped (no encode, no write). Used on the probe (right) side
+        // to skip partitions that have an empty build (left) side — those
+        // rows can never produce a join match.
+        keep_partition: Option<&[bool]>,
+        // If Some(mask), each row that IS spilled marks mask[idx] = true.
+        // Used on the build (left) side to record which partitions are
+        // non-empty for the subsequent probe-side spill.
+        record_non_empty: Option<&mut [bool]>,
+        // If Some(bloom), each spilled row's key hash is inserted. Build side.
+        bloom_insert: Option<&mut BloomFilter>,
+        // If Some(bloom), rows whose key hash is not in the filter are dropped.
+        // Probe side. Operates per-row (finer than `keep_partition`).
+        bloom_check: Option<&BloomFilter>,
+    ) -> Result<()> {
+        let mut record = record_non_empty;
+        let mut insert = bloom_insert;
+        while let Some(row) = child.next()? {
+            let key_hash = Self::key_hash_64(&row, key_indices);
+            let partition_idx = (key_hash as usize) % partition_count;
+
+            if let Some(mask) = keep_partition {
+                if !mask[partition_idx] {
+                    continue;
+                }
+            }
+            if let Some(bf) = bloom_check {
+                if !bf.might_contain(key_hash) {
+                    continue;
+                }
+            }
+
+            let encoded = encode_row(&row, cols)?;
+            if encoded.len() > block_size as usize - 2 {
+                anyhow::bail!(
+                    "HashJoin: row ({} B) exceeds usable block space ({} B)",
+                    encoded.len(),
+                    block_size as usize - 2,
+                );
+            }
+
+            Self::append_encoded_row(block_size, disk_access, anon_allocator, &mut partitions[partition_idx], &encoded)?;
+            if let Some(m) = record.as_deref_mut() {
+                m[partition_idx] = true;
+            }
+            if let Some(bf) = insert.as_deref_mut() {
+                bf.insert(key_hash);
+            }
+        }
+
+        for partition in partitions.iter_mut() {
+            Self::flush_partition_block(block_size, disk_access, anon_allocator, partition)?;
+            Self::flush_partition_pending(block_size, disk_access, anon_allocator, partition)?;
+        }
+        Ok(())
+    }
+
+    fn free_extents(anon_allocator: &AnonBlockAllocator, extents: Vec<(u64, u64)>) {
+        for (start, count) in extents {
+            anon_allocator.free(start, count);
+        }
+    }
+
+    fn load_next_partition(&mut self) -> Result<bool> {
+        self.left_hash.clear();
+        self.current_right_row = None;
+        self.current_left_matches.clear();
+        self.current_left_match_idx = 0;
+
+        while self.probe_partition_idx < self.partition_count {
+            let idx = self.probe_partition_idx;
+            let left_extents = std::mem::take(&mut self.left_partitions[idx].extents);
+            let right_extents = std::mem::take(&mut self.right_partitions[idx].extents);
+
+            if left_extents.is_empty() || right_extents.is_empty() {
+                Self::free_extents(&self.anon_allocator, left_extents);
+                Self::free_extents(&self.anon_allocator, right_extents);
+                self.probe_partition_idx += 1;
+                continue;
+            }
+
+            let mut left_reader = SegmentedRunReader::new(
+                self.disk_access.clone(),
+                self.left_cols.clone(),
+                self.block_size,
+                left_extents.clone(),
+            );
+
+            while let Some(row) = left_reader.next_row()? {
+                let key = Self::row_key(&row, &self.left_key_idx);
+                self.left_hash.entry(key).or_default().push(row);
+            }
+
+            Self::free_extents(&self.anon_allocator, left_extents);
+
+            if self.left_hash.is_empty() {
+                Self::free_extents(&self.anon_allocator, right_extents);
+                self.probe_partition_idx += 1;
+                continue;
+            }
+
+            self.current_right_extents = right_extents;
+            self.current_right_reader = Some(SegmentedRunReader::new(
+                self.disk_access.clone(),
+                self.right_cols.clone(),
+                self.block_size,
+                self.current_right_extents.clone(),
+            ));
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    fn release_current_right_partition(&mut self) {
+        let extents = std::mem::take(&mut self.current_right_extents);
+        Self::free_extents(&self.anon_allocator, extents);
+    }
+
+    /// Conservative byte-cost estimate for one row sitting in the build hash
+    /// table. Includes the stored Row, the duplicated key Vec<Data>, and the
+    /// HashMap entry overhead. Over-estimates rather than under, so the
+    /// in-memory budget guard never lets total RAM exceed `inmem_cap`.
+    fn approx_row_bytes(row: &Row) -> u64 {
+        // 64 B HashMap entry + 24 B Row header + 24 B value Vec header
+        let mut b: u64 = 112;
+        for v in row.values() {
+            b += 24; // Data enum slot
+            if let Data::String(s) = v {
+                b += 24 + s.len() as u64; // String header + content
+            }
+        }
+        // Key Vec<Data> mirror — 24 B header + per-key-col 24 B (+ string tail).
+        // We don't have key_indices here; assume up to 4 key cols at 24 B each,
+        // which over-estimates for typical 1-2 col equi-joins.
+        b + 24 + 24 * 4
+    }
+
+    /// Spill one already-materialised row into a partition buffer (used by the
+    /// hybrid fallback when re-routing rows that were buffered in `left_hash`).
+    fn spill_one_row(
+        block_size: u64,
+        disk_access: &Arc<Mutex<DiskAccessLayer<R, W>>>,
+        anon_allocator: &AnonBlockAllocator,
+        partitions: &mut [PartitionBuffer],
+        cols: &[ColumnCatalog],
+        key_indices: &[usize],
+        non_empty: &mut [bool],
+        bloom: &mut BloomFilter,
+        partition_count: usize,
+        row: Row,
+    ) -> Result<()> {
+        let key_hash = Self::key_hash_64(&row, key_indices);
+        let pidx = (key_hash as usize) % partition_count;
+        let encoded = encode_row(&row, cols)?;
+        if encoded.len() > block_size as usize - 2 {
+            anyhow::bail!(
+                "HashJoin: row ({} B) exceeds usable block space ({} B)",
+                encoded.len(),
+                block_size as usize - 2,
+            );
+        }
+        Self::append_encoded_row(block_size, disk_access, anon_allocator,
+            &mut partitions[pidx], &encoded)?;
+        non_empty[pidx] = true;
+        bloom.insert(key_hash);
+        Ok(())
+    }
+
+    fn initialize(&mut self) -> Result<()> {
+        let mut left = self.left.take().unwrap();
+        let mut right = self.right.take().unwrap();
+
+        let disk_access = self.disk_access.clone();
+        let anon_allocator = self.anon_allocator.clone();
+        let block_size = self.block_size;
+        let partition_count = self.partition_count;
+        let left_cols = self.left_cols.clone();
+        let right_cols = self.right_cols.clone();
+        let left_key_idx = self.left_key_idx.clone();
+        let right_key_idx = self.right_key_idx.clone();
+
+        // ------------------------------------------------------------------
+        // Phase 1 — try fully in-memory build (hybrid fast path).
+        //
+        // Use half of the operator's memory budget for the hash table; the
+        // other half is reserved so a fallback to grace mode (partition
+        // pending buffers + Bloom + per-row work) cannot OOM. If the build
+        // exceeds `inmem_cap` we abort the in-memory attempt cleanly and
+        // re-route everything we accumulated into the partitioned spill.
+        // ------------------------------------------------------------------
+        // Bumped from 1/2 → 3/5 of operator budget. The remaining 2/5 still
+        // covers the grace-fallback partition pending buffers (~2 MB at
+        // HASH_PARTITIONS=16, batch=32) + the 1 MB Bloom + per-row work.
+        // Letting more builds stay fully in-memory eliminates whole HJ spills,
+        // which is the dominant cost on rotational-latency-heavy queries.
+        let inmem_cap = self.memory_limit_bytes * 2 / 3;
+        let mut inmem_bytes: u64 = 0;
+        let mut overflow_row: Option<Row> = None;
+
+        loop {
+            let row = match left.next()? {
+                Some(r) => r,
+                None    => break,
+            };
+            let row_bytes = Self::approx_row_bytes(&row);
+            if inmem_bytes.saturating_add(row_bytes) > inmem_cap {
+                // Don't insert this row — it triggered the overflow. Spill it
+                // along with everything already buffered in the fallback path.
+                overflow_row = Some(row);
+                break;
+            }
+            inmem_bytes += row_bytes;
+            let key = Self::row_key(&row, &left_key_idx);
+            self.left_hash.entry(key).or_default().push(row);
+        }
+
+        if overflow_row.is_none() {
+            // Build fits entirely in RAM. Skip ALL spilling on both sides:
+            // probe will stream the right child directly against `left_hash`.
+            self.inmem_mode = true;
+            self.right = Some(right);
+            self.initialized = true;
+            return Ok(());
+        }
+
+        // ------------------------------------------------------------------
+        // Phase 2 — fallback to grace hash join.
+        //
+        // Re-route every row currently buffered in `left_hash` into the
+        // partitioned spill, then the overflow row, then the rest of the
+        // left iterator. Build the Bloom filter as we go so the right-side
+        // spill (which follows) can drop non-matching probe rows up-front.
+        // ------------------------------------------------------------------
+        const BLOOM_MAX_BYTES: usize = 1 << 20;     // 1 MB
+        const BLOOM_EXPECTED_HINT: usize = 1 << 17; // 128 K elements
+        self.left_bloom = Some(BloomFilter::new(BLOOM_EXPECTED_HINT, BLOOM_MAX_BYTES));
+
+        // Drain the in-memory buffer into partitions. We move out of
+        // `self.left_hash` so its allocations get freed promptly.
+        let buffered = std::mem::take(&mut self.left_hash);
+        {
+            let bloom = self.left_bloom.as_mut().unwrap();
+            for (_, rows) in buffered {
+                for row in rows {
+                    Self::spill_one_row(
+                        block_size, &disk_access, &anon_allocator,
+                        &mut self.left_partitions, &left_cols, &left_key_idx,
+                        &mut self.non_empty_left, bloom, partition_count, row,
+                    )?;
+                }
+            }
+            // Spill the overflow row that triggered the transition.
+            Self::spill_one_row(
+                block_size, &disk_access, &anon_allocator,
+                &mut self.left_partitions, &left_cols, &left_key_idx,
+                &mut self.non_empty_left, bloom, partition_count,
+                overflow_row.unwrap(),
+            )?;
+        }
+
+        // Continue draining left into partitions via the standard spill loop.
+        Self::spill_side(
+            block_size,
+            partition_count,
+            &disk_access,
+            &anon_allocator,
+            &mut left,
+            &mut self.left_partitions,
+            &left_cols,
+            &left_key_idx,
+            None,
+            Some(&mut self.non_empty_left),
+            self.left_bloom.as_mut(),
+            None,
+        )?;
+        drop(left);
+
+        Self::spill_side(
+            block_size,
+            partition_count,
+            &disk_access,
+            &anon_allocator,
+            &mut right,
+            &mut self.right_partitions,
+            &right_cols,
+            &right_key_idx,
+            Some(&self.non_empty_left),
+            None,
+            None,
+            self.left_bloom.as_ref(),
+        )?;
+        // Bloom no longer needed past spill phase; build hash is rebuilt
+        // per-partition during probe.
+        self.left_bloom = None;
+
+        for p in &mut self.left_partitions {
+            p.block = Vec::new();
+            p.pending = Vec::new();
+        }
+        for p in &mut self.right_partitions {
+            p.block = Vec::new();
+            p.pending = Vec::new();
+        }
+
+        self.initialized = true;
+        Ok(())
+    }
+
+    fn next_inmem(&mut self) -> Result<Option<Row>> {
+        loop {
+            // Drain pending matches for the current right row first.
+            if let Some(right_row) = self.current_right_row.as_ref() {
+                if self.current_left_match_idx < self.current_left_matches.len() {
+                    let left_row = &self.current_left_matches[self.current_left_match_idx];
+                    self.current_left_match_idx += 1;
+                    let mut values = left_row.values().to_vec();
+                    values.extend_from_slice(right_row.values());
+                    return Ok(Some(Row::new(values)));
+                }
+                self.current_right_row = None;
+                self.current_left_matches.clear();
+                self.current_left_match_idx = 0;
+            }
+
+            // Pull next right row directly from the held child iterator.
+            let right = match self.right.as_mut() {
+                Some(r) => r,
+                None    => { self.done = true; return Ok(None); }
+            };
+            match right.next()? {
+                None => {
+                    self.done = true;
+                    self.right = None;
+                    self.left_hash.clear();
+                    return Ok(None);
+                }
+                Some(right_row) => {
+                    let key = Self::row_key(&right_row, &self.right_key_idx);
+                    if let Some(left_rows) = self.left_hash.get(&key) {
+                        self.current_right_row = Some(right_row);
+                        self.current_left_matches = left_rows.clone();
+                        self.current_left_match_idx = 0;
+                    }
+                    // else: no match, loop continues to next right row
+                }
+            }
+        }
+    }
+}
+
+impl<R: Read, W: Write> Operator for HashJoinOperator<R, W> {
+    fn schema(&self) -> &Schema { &self.schema }
+
+    fn next(&mut self) -> Result<Option<Row>> {
+        if !self.initialized {
+            self.initialize()?;
+        }
+
+        if self.done {
+            return Ok(None);
+        }
+
+        if self.inmem_mode {
+            return self.next_inmem();
+        }
+
+        loop {
+            if let Some(right_row) = self.current_right_row.as_ref() {
+                if self.current_left_match_idx < self.current_left_matches.len() {
+                    let left_row = &self.current_left_matches[self.current_left_match_idx];
+                    self.current_left_match_idx += 1;
+                    let mut values = left_row.values().to_vec();
+                    values.extend_from_slice(right_row.values());
+                    return Ok(Some(Row::new(values)));
+                }
+
+                self.current_right_row = None;
+                self.current_left_matches.clear();
+                self.current_left_match_idx = 0;
+                continue;
+            }
+
+            if self.current_right_reader.is_none() {
+                if !self.load_next_partition()? {
+                    self.done = true;
+                    return Ok(None);
+                }
+                continue;
+            }
+
+            match self.current_right_reader.as_mut().unwrap().next_row()? {
+                Some(right_row) => {
+                    let key = Self::row_key(&right_row, &self.right_key_idx);
+                    if let Some(left_rows) = self.left_hash.get(&key) {
+                        self.current_right_row = Some(right_row);
+                        self.current_left_matches = left_rows.clone();
+                        self.current_left_match_idx = 0;
+                    }
+                }
+                None => {
+                    self.current_right_reader = None;
+                    self.release_current_right_partition();
+                    self.probe_partition_idx += 1;
+                }
+            }
+        }
+    }
+}
+
+impl<R: Read, W: Write> Drop for HashJoinOperator<R, W> {
+    fn drop(&mut self) {
+        for partition in &mut self.left_partitions {
+            for (start, count) in partition.extents.drain(..) {
+                self.anon_allocator.free(start, count);
+            }
+        }
+        for partition in &mut self.right_partitions {
+            for (start, count) in partition.extents.drain(..) {
+                self.anon_allocator.free(start, count);
+            }
+        }
+        for (start, count) in self.current_right_extents.drain(..) {
+            self.anon_allocator.free(start, count);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SortOperator  (external merge sort via anonymous disk blocks)
 // ---------------------------------------------------------------------------
@@ -595,6 +1682,107 @@ struct RunReader<R: Read, W: Write> {
     blocks_read: u64,
     current_rows: Vec<Row>,
     row_idx: usize,
+}
+
+/// Reads one spilled run from possibly non-contiguous anonymous disk extents.
+///
+/// Extents are written in allocation order and replayed in that same logical
+/// order. Each extent itself is contiguous and fetched in small prefetch chunks.
+struct SegmentedRunReader<R: Read, W: Write> {
+    disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
+    columns: Vec<ColumnCatalog>,
+    block_size: u64,
+    extents: Vec<(u64, u64)>,
+    extent_idx: usize,
+    blocks_read_in_extent: u64,
+    current_rows: Vec<Row>,
+    row_idx: usize,
+    raw_buf: Vec<u8>,   // raw prefetched bytes not yet decoded
+    raw_decoded: u64,   // blocks from raw_buf already decoded
+    raw_total: u64,     // blocks currently in raw_buf
+}
+
+impl<R: Read, W: Write> SegmentedRunReader<R, W> {
+    fn new(
+        disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
+        columns: Vec<ColumnCatalog>,
+        block_size: u64,
+        extents: Vec<(u64, u64)>,
+    ) -> Self {
+        Self {
+            disk_access,
+            columns,
+            block_size,
+            extents,
+            extent_idx: 0,
+            blocks_read_in_extent: 0,
+            current_rows: Vec::new(),
+            row_idx: 0,
+            raw_buf: Vec::new(),
+            raw_decoded: 0,
+            raw_total: 0,
+        }
+    }
+
+    fn next_row(&mut self) -> Result<Option<Row>> {
+        loop {
+            // Serve from already-decoded rows.
+            if self.row_idx < self.current_rows.len() {
+                let row = self.current_rows[self.row_idx].clone();
+                self.row_idx += 1;
+                return Ok(Some(row));
+            }
+
+            // Decode the next raw block from the prefetch buffer.
+            if self.raw_decoded < self.raw_total {
+                let bs = self.block_size as usize;
+                let start = self.raw_decoded as usize * bs;
+                let slice = &self.raw_buf[start..start + bs];
+                self.current_rows = decode_block(slice, self.block_size, &self.columns)?;
+                self.row_idx = 0;
+                self.raw_decoded += 1;
+                continue;
+            }
+
+            // Fetch the next batch of raw blocks from disk.
+            loop {
+                if self.extent_idx >= self.extents.len() {
+                    return Ok(None);
+                }
+                let (start, len) = self.extents[self.extent_idx];
+                if self.blocks_read_in_extent >= len {
+                    self.extent_idx += 1;
+                    self.blocks_read_in_extent = 0;
+                    continue;
+                }
+                let remaining = len - self.blocks_read_in_extent;
+                let fetch = remaining.min(RUN_PREFETCH_SIZE);
+                let block_id = start + self.blocks_read_in_extent;
+                self.raw_buf = {
+                    let mut disk = self.disk_access.lock().unwrap();
+                    disk.read_blocks(block_id, fetch)?
+                };
+                self.raw_decoded = 0;
+                self.raw_total = fetch;
+                self.blocks_read_in_extent += fetch;
+                break;
+            }
+        }
+    }
+}
+
+fn push_extent(extents: &mut Vec<(u64, u64)>, start: u64, count: u64) {
+    if count == 0 {
+        return;
+    }
+    if let Some((last_start, last_count)) = extents.last_mut() {
+        let last_end = *last_start + *last_count;
+        if last_end == start {
+            *last_count += count;
+            return;
+        }
+    }
+    extents.push((start, count));
 }
 
 impl<R: Read, W: Write> RunReader<R, W> {
@@ -620,13 +1808,22 @@ impl<R: Read, W: Write> RunReader<R, W> {
                 return Ok(None);
             }
             let block_id = self.start_block + self.blocks_read;
+            let remaining = self.num_blocks - self.blocks_read;
+            let fetch = remaining.min(RUN_PREFETCH_SIZE);
             let data = {
                 let mut disk = self.disk_access.lock().unwrap();
-                disk.read_blocks(block_id, 1)?
+                disk.read_blocks(block_id, fetch)?
             };
-            self.current_rows = decode_block(&data, self.block_size, &self.columns)?;
+            let bs = self.block_size as usize;
+            let mut all_rows = Vec::new();
+            for i in 0..fetch as usize {
+                let slice = &data[i * bs..(i + 1) * bs];
+                let mut block_rows = decode_block(slice, self.block_size, &self.columns)?;
+                all_rows.append(&mut block_rows);
+            }
+            self.current_rows = all_rows;
             self.row_idx = 0;
-            self.blocks_read += 1;
+            self.blocks_read += fetch;
         }
     }
 }
@@ -666,6 +1863,7 @@ impl Ord for HeapEntry {
 pub struct SortOperator<R: Read, W: Write> {
     child: Option<Box<dyn Operator>>,
     sort_specs: Vec<SortSpec>,
+    sort_key_indices: Vec<(usize, bool)>,  // pre-compiled from sort_specs
     schema: Schema,
     memory_limit_bytes: u64,
     disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
@@ -676,7 +1874,7 @@ pub struct SortOperator<R: Read, W: Write> {
     in_memory_rows: Vec<Row>,
     in_memory_idx: usize,
     // External-sort path
-    run_readers: Vec<RunReader<R, W>>,
+    run_readers: Vec<SegmentedRunReader<R, W>>,
     merge_heap: BinaryHeap<HeapEntry>,
 }
 
@@ -690,8 +1888,11 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         anon_allocator: AnonBlockAllocator,
     ) -> Self {
         let schema = child.schema().clone();
+        let sort_key_indices = sort_specs.iter()
+            .map(|s| (schema.get_index(&s.column_name).unwrap_or(0), s.ascending))
+            .collect();
         SortOperator {
-            child: Some(child), sort_specs, schema,
+            child: Some(child), sort_specs, sort_key_indices, schema,
             memory_limit_bytes, disk_access, block_size, anon_allocator,
             initialized: false,
             in_memory_rows: Vec::new(), in_memory_idx: 0,
@@ -711,13 +1912,12 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         size
     }
 
-    fn sort_slice(rows: &mut Vec<Row>, specs: &[SortSpec], schema: &Schema) {
+    fn sort_slice(rows: &mut Vec<Row>, key_indices: &[(usize, bool)]) {
         rows.sort_unstable_by(|a, b| {
-            for spec in specs {
-                let idx = schema.get_index(&spec.column_name).unwrap_or(0);
+            for &(idx, asc) in key_indices {
                 if let (Some(av), Some(bv)) = (a.get(idx), b.get(idx)) {
                     let ord = av.partial_cmp(bv).unwrap_or(std::cmp::Ordering::Equal);
-                    let ord = if spec.ascending { ord } else { ord.reverse() };
+                    let ord = if asc { ord } else { ord.reverse() };
                     if ord != std::cmp::Ordering::Equal { return ord; }
                 }
             }
@@ -725,90 +1925,102 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         });
     }
 
-    /// Write a sorted chunk to anonymous disk one block at a time.
+    /// Write a sorted chunk to anonymous disk.
     ///
-    /// Unlike the old implementation (which called encode_rows_to_blocks and
-    /// kept a full encoded Vec<u8> equal in size to the in-memory chunk in RAM
-    /// simultaneously), this encodes and flushes one block at a time so the
-    /// only extra allocation is a single block_size buffer (~4 KB).
+    /// Two-pass design:
+    ///   Pass 1 – count exact block count via `count_run_blocks` (no allocation).
+    ///   Pass 2 – encode rows and write in BATCH_BLOCKS-sized batches.
     ///
-    /// Peak additional memory: block_size (negligible).
+    /// A single `allocate(num_blocks)` call gives one contiguous disk range so
+    /// RunReader can replay it with sequential IDs.  Peak extra allocation is
+    /// BATCH_BLOCKS × block_size (1 MB), independent of chunk size or schema —
+    /// no OOM regardless of memory limit, dataset, or string widths.
     fn write_run(&self, rows: &[Row]) -> Result<(u64, u64)> {
         let cols   = self.schema.columns();
-        let usable = self.block_size as usize - 2;
+        let bs     = self.block_size as usize;
+        let usable = bs - 2;
 
-        let mut block_buf   = vec![0u8; self.block_size as usize];
-        let mut buf_offset  = 0usize;
-        let mut rows_in_blk = 0u16;
-        let mut total_blks  = 0u64;
-        let mut first_blk   = 0u64;
-        let mut got_first   = false;
+        // Pass 1: count blocks without allocating any encoded buffer.
+        let num_blocks = count_run_blocks(rows, cols, bs)?;
+        if num_blocks == 0 { return Ok((0, 0)); }
+
+        // Single allocate → contiguous range, immune to free-list fragmentation.
+        let start = self.anon_allocator.allocate(num_blocks);
+
+        // Pass 2: encode + write through a fixed 1 MB batch buffer.
+        let batch_bytes = BATCH_BLOCKS * bs;
+        let mut batch    = vec![0u8; batch_bytes];
+        let mut in_batch = 0usize; // full blocks currently in `batch`
+        let mut blks_out = 0u64;
+
+        let mut block    = vec![0u8; bs];
+        let mut blk_off  = 0usize;
+        let mut rows_blk = 0u16;
 
         for row in rows {
             let enc = encode_row(row, cols)?;
-            if enc.len() > usable {
-                anyhow::bail!(
-                    "SortOperator: row ({} B) exceeds usable block space ({} B)",
-                    enc.len(), usable
-                );
+            if blk_off + enc.len() > usable {
+                // Seal current block into batch.
+                let footer = block.len() - 2;
+                block[footer..].copy_from_slice(&rows_blk.to_le_bytes());
+                batch[in_batch * bs..(in_batch + 1) * bs].copy_from_slice(&block);
+                block.fill(0); blk_off = 0; rows_blk = 0;
+                in_batch += 1;
+                if in_batch == BATCH_BLOCKS {
+                    let n = in_batch as u64;
+                    self.disk_access.lock().unwrap()
+                        .write_blocks(start + blks_out, n, &batch)?;
+                    blks_out += n; in_batch = 0;
+                }
             }
-            if buf_offset + enc.len() > usable {
-                // Flush full block
-                let footer = block_buf.len() - 2;
-                block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
-                let id = self.anon_allocator.allocate(1);
-                if !got_first { first_blk = id; got_first = true; }
-                self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
-                total_blks += 1;
-                block_buf.fill(0); buf_offset = 0; rows_in_blk = 0;
-            }
-            block_buf[buf_offset..buf_offset + enc.len()].copy_from_slice(&enc);
-            buf_offset  += enc.len();
-            rows_in_blk += 1;
+            block[blk_off..blk_off + enc.len()].copy_from_slice(&enc);
+            blk_off  += enc.len();
+            rows_blk += 1;
         }
 
-        // Flush the final (possibly partial) block.
-        if rows_in_blk > 0 {
-            let footer = block_buf.len() - 2;
-            block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
-            let id = self.anon_allocator.allocate(1);
-            if !got_first { first_blk = id; }
-            self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
-            total_blks += 1;
+        // Seal and flush the final (partial) block + remaining batch.
+        if rows_blk > 0 {
+            let footer = block.len() - 2;
+            block[footer..].copy_from_slice(&rows_blk.to_le_bytes());
+            batch[in_batch * bs..(in_batch + 1) * bs].copy_from_slice(&block);
+            in_batch += 1;
+        }
+        if in_batch > 0 {
+            let n = in_batch as u64;
+            self.disk_access.lock().unwrap()
+                .write_blocks(start + blks_out, n, &batch[..in_batch * bs])?;
+            blks_out += n;
         }
 
-        Ok((first_blk, total_blks))
+        debug_assert_eq!(blks_out, num_blocks, "write_run: block count mismatch");
+        Ok((start, num_blocks))
     }
 
     fn make_heap_key(&self, row: &Row) -> Vec<(Data, bool)> {
-        self.sort_specs.iter().map(|spec| {
-            let idx = self.schema.get_index(&spec.column_name).unwrap_or(0);
-            let val = row.get(idx).cloned().unwrap_or(Data::Int32(0));
-            (val, spec.ascending)
+        self.sort_key_indices.iter().map(|&(idx, asc)| {
+            (row.get(idx).cloned().unwrap_or(Data::Int32(0)), asc)
         }).collect()
     }
 
     /// Max number of runs we can merge simultaneously without exceeding the
     /// memory budget.
     ///
-    /// During a merge pass each RunReader holds one block's worth of decoded
-    /// rows in RAM (`current_rows`). The HeapEntry for each run adds one
-    /// key clone (small). One additional block_size buffer is needed
-    /// transiently when loading the next block (shared, not per-run).
+    /// Each SegmentedRunReader holds simultaneously:
+    ///   - raw_buf: ALL RUN_PREFETCH_SIZE raw blocks (never shrunk between decodes)
+    ///   - current_rows: 1 decoded block (8× worst-case Int32 expansion)
+    ///   - a HeapEntry key clone
     ///
-    ///   per_run  ≈  block_size          (decoded rows ≈ one encoded block)
-    ///            +  sort_specs.len() × 48  (HeapEntry.key)
-    ///   fan_in   =  (available − block_size) / per_run
-    /// 
+    ///   per_run = (RUN_PREFETCH_SIZE + 8) × block_size + key_size
+    ///   fan_in  = (available − write_buf) / per_run
     fn merge_fan_in(&self) -> usize {
-        // to be check
-        const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
+        let write_buf = BATCH_BLOCKS as u64 * self.block_size;
         let available = self.memory_limit_bytes
-            .saturating_sub(PROCESS_OVERHEAD)
-            .saturating_sub(self.block_size) as usize;
-        //TO BE CHECK
-        let key_size  = 24 + self.sort_specs.len() * 40; // Vec header (24) + (Data,bool) per col (40)
-        let per_run   = self.block_size as usize + key_size;
+            .saturating_sub(write_buf) as usize;
+
+        // raw_buf is allocated for all RUN_PREFETCH_SIZE raw blocks at once (never
+        // partially freed), plus 1 decoded block at 8× expansion.
+        let key_size = 24 + self.sort_specs.len() * 40;
+        let per_run  = (RUN_PREFETCH_SIZE as usize + 8) * self.block_size as usize + key_size;
         (available / per_run.max(1)).max(2)
     }
 
@@ -817,12 +2029,12 @@ impl<R: Read, W: Write> SortOperator<R, W> {
     ///
     /// Streams row-by-row via the k-way heap — at most one block per input
     /// run is decoded at any time, plus one output block buffer.
-    fn merge_runs_to_disk(&self, run_specs: &[(u64, u64)]) -> Result<(u64, u64)> {
+    fn merge_runs_to_disk(&self, run_specs: &[Vec<(u64, u64)>]) -> Result<Vec<(u64, u64)>> {
         let cols = self.schema.columns().to_vec();
 
-        let mut readers: Vec<RunReader<R, W>> = run_specs.iter()
-            .map(|&(start, n)| RunReader::new(
-                self.disk_access.clone(), cols.clone(), self.block_size, start, n,
+        let mut readers: Vec<SegmentedRunReader<R, W>> = run_specs.iter()
+            .map(|extents| SegmentedRunReader::new(
+                self.disk_access.clone(), cols.clone(), self.block_size, extents.clone(),
             ))
             .collect();
 
@@ -834,13 +2046,17 @@ impl<R: Read, W: Write> SortOperator<R, W> {
             }
         }
 
-        let usable          = self.block_size as usize - 2;
-        let mut block_buf   = vec![0u8; self.block_size as usize];
-        let mut buf_offset  = 0usize;
-        let mut rows_in_blk = 0u16;
-        let mut total_blks  = 0u64;
-        let mut first_blk   = 0u64;
-        let mut got_first   = false;
+        let bs     = self.block_size as usize;
+        let usable = bs - 2;
+
+        let batch_bytes = BATCH_BLOCKS * bs;
+        let mut batch    = vec![0u8; batch_bytes];
+        let mut in_batch = 0usize;
+        let mut out_extents: Vec<(u64, u64)> = Vec::new();
+
+        let mut block    = vec![0u8; bs];
+        let mut blk_off  = 0usize;
+        let mut rows_blk = 0u16;
 
         while let Some(entry) = heap.pop() {
             let run_idx = entry.run_idx;
@@ -857,33 +2073,42 @@ impl<R: Read, W: Write> SortOperator<R, W> {
                 );
             }
 
-            if buf_offset + encoded.len() > usable {
-                // Flush full block
-                let footer = block_buf.len() - 2;
-                block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
-                let id = self.anon_allocator.allocate(1);
-                if !got_first { first_blk = id; got_first = true; }
-                self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
-                total_blks += 1;
-                block_buf.fill(0); buf_offset = 0; rows_in_blk = 0;
+            if blk_off + encoded.len() > usable {
+                let footer = block.len() - 2;
+                block[footer..].copy_from_slice(&rows_blk.to_le_bytes());
+                batch[in_batch * bs..(in_batch + 1) * bs].copy_from_slice(&block);
+                block.fill(0); blk_off = 0; rows_blk = 0;
+                in_batch += 1;
+                if in_batch == BATCH_BLOCKS {
+                    let n = in_batch as u64;
+                    let start = self.anon_allocator.allocate(n);
+                    push_extent(&mut out_extents, start, n);
+                    self.disk_access.lock().unwrap()
+                        .write_blocks(start, n, &batch[..in_batch * bs])?;
+                    in_batch = 0;
+                }
             }
 
-            block_buf[buf_offset..buf_offset + encoded.len()].copy_from_slice(&encoded);
-            buf_offset  += encoded.len();
-            rows_in_blk += 1;
+            block[blk_off..blk_off + encoded.len()].copy_from_slice(&encoded);
+            blk_off  += encoded.len();
+            rows_blk += 1;
         }
 
-        // Flush final (possibly partial) block
-        if rows_in_blk > 0 {
-            let footer = block_buf.len() - 2;
-            block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
-            let id = self.anon_allocator.allocate(1);
-            if !got_first { first_blk = id; }
-            self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
-            total_blks += 1;
+        if rows_blk > 0 {
+            let footer = block.len() - 2;
+            block[footer..].copy_from_slice(&rows_blk.to_le_bytes());
+            batch[in_batch * bs..(in_batch + 1) * bs].copy_from_slice(&block);
+            in_batch += 1;
+        }
+        if in_batch > 0 {
+            let n = in_batch as u64;
+            let start = self.anon_allocator.allocate(n);
+            push_extent(&mut out_extents, start, n);
+            self.disk_access.lock().unwrap()
+                .write_blocks(start, n, &batch[..in_batch * bs])?;
         }
 
-        Ok((first_blk, total_blks))
+        Ok(out_extents)
     }
 
     /// Prime the final streaming merge heap from `self.run_readers`.
@@ -898,7 +2123,6 @@ impl<R: Read, W: Write> SortOperator<R, W> {
     }
 
     fn initialize(&mut self) -> Result<()> {
-        let row_size = self.row_mem_estimate();
         // Sorting chunk budget.
         //
         // write_run now encodes and flushes one block at a time (peak extra
@@ -912,35 +2136,38 @@ impl<R: Read, W: Write> SortOperator<R, W> {
         //   - SMJ right-group rows held by parent operators
         //   - Other heap allocations in the pipeline
         //
-        // Process overhead accounts for: binary .text/.data, mmap'd shared
-        // libraries, stack reservation, heap metadata, and Rust runtime.
-        // Measured at ~12 MB (release) / ~14 MB (debug) at startup; 32 MB
-        // is kept as a safety margin for the portal's larger shared-lib set.
-        const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
-        let usable = self.memory_limit_bytes.saturating_sub(PROCESS_OVERHEAD);
-        let budget = (usable as usize) * 70 / 100;
-        if budget < row_size {
+        // `memory_limit_bytes` is already a per-operator budget from main.rs.
+        let usable = self.memory_limit_bytes;
+        // Bigger first-pass chunks → fewer initial runs → fewer (or zero)
+        // intermediate merge passes. Bumped 40% → 50% — the largest fraction
+        // we can take without starving the merge-phase fan_in × block_size
+        // reader buffers and the 1 MB write_run batch.
+        let budget = (usable as usize) * 60 / 100;
+        if budget == 0 {
             anyhow::bail!(
-                "SortOperator: memory limit ({} bytes) too small to hold even one row (~{} bytes estimated)",
-                self.memory_limit_bytes,
-                row_size
+                "SortOperator: memory limit ({} bytes) too small after overhead reservation",
+                self.memory_limit_bytes
             );
         }
-        let chunk_capacity = (budget / row_size).max(1);
 
         let mut child = self.child.take().unwrap();
-        let mut chunk: Vec<Row> = Vec::with_capacity(chunk_capacity);
-        let mut runs: Vec<(u64, u64)> = Vec::new();
+        let mut chunk: Vec<Row> = Vec::new();
+        let mut chunk_mem = 0usize;
+        let mut runs: Vec<Vec<(u64, u64)>> = Vec::new();
 
         loop {
             match child.next()? {
                 Some(row) => {
-                    chunk.push(row);
-                    if chunk.len() >= chunk_capacity {
-                        Self::sort_slice(&mut chunk, &self.sort_specs, &self.schema);
-                        runs.push(self.write_run(&chunk)?);
-                        chunk.clear();
+                    let row_mem = row.exact_mem_size();
+                    if !chunk.is_empty() && chunk_mem.saturating_add(row_mem) > budget {
+                        Self::sort_slice(&mut chunk, &self.sort_key_indices);
+                        let (start, n) = self.write_run(&chunk)?;
+                        runs.push(vec![(start, n)]);
+                        chunk = Vec::new();
+                        chunk_mem = 0;
                     }
+                    chunk_mem = chunk_mem.saturating_add(row_mem);
+                    chunk.push(row);
                 }
                 None => break,
             }
@@ -948,13 +2175,14 @@ impl<R: Read, W: Write> SortOperator<R, W> {
 
         if runs.is_empty() {
             // Everything fit in one chunk — pure in-memory sort, no disk needed
-            Self::sort_slice(&mut chunk, &self.sort_specs, &self.schema);
+            Self::sort_slice(&mut chunk, &self.sort_key_indices);
             self.in_memory_rows = chunk;
         } else {
             // Flush the tail chunk as the last run (if non-empty)
             if !chunk.is_empty() {
-                Self::sort_slice(&mut chunk, &self.sort_specs, &self.schema);
-                runs.push(self.write_run(&chunk)?);
+                Self::sort_slice(&mut chunk, &self.sort_key_indices);
+                let (start, n) = self.write_run(&chunk)?;
+                runs.push(vec![(start, n)]);
             }
             drop(chunk); // free before merge
 
@@ -971,15 +2199,21 @@ impl<R: Read, W: Write> SortOperator<R, W> {
                 let mut merged = Vec::with_capacity((runs.len() + fan_in - 1) / fan_in);
                 for batch in runs.chunks(fan_in) {
                     merged.push(self.merge_runs_to_disk(batch)?);
+                    // Input runs are fully consumed; return their blocks for reuse.
+                    for run in batch {
+                        for &(start, n) in run {
+                            self.anon_allocator.free(start, n);
+                        }
+                    }
                 }
                 runs = merged;
             }
 
             // Final pass: set up streaming k-way merge via BinaryHeap
             let cols = self.schema.columns().to_vec();
-            for (start, n) in runs {
-                self.run_readers.push(RunReader::new(
-                    self.disk_access.clone(), cols.clone(), self.block_size, start, n,
+            for run_extents in runs {
+                self.run_readers.push(SegmentedRunReader::new(
+                    self.disk_access.clone(), cols.clone(), self.block_size, run_extents,
                 ));
             }
             self.prime_merge_heap()?;
@@ -1024,6 +2258,17 @@ impl<R: Read, W: Write> Operator for SortOperator<R, W> {
     }
 }
 
+impl<R: Read, W: Write> Drop for SortOperator<R, W> {
+    fn drop(&mut self) {
+        for rr in &self.run_readers {
+            for &(start, count) in &rr.extents {
+                self.anon_allocator.free(start, count);
+            }
+        }
+        self.run_readers.clear();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SortMergeJoinOperator
 //
@@ -1031,7 +2276,7 @@ impl<R: Read, W: Write> Operator for SortOperator<R, W> {
 // The optimizer must insert Sort nodes below Join when choosing SMJ.
 //
 // Right equal-group memory policy:
-//   Budget  = memory_limit - PROCESS_OVERHEAD
+//   Budget  = per-operator memory budget from main.rs
 //   Max rows in RAM = budget / right_row_size  (conservative overestimate)
 //   If group fits → pure RAM, no disk I/O (fastest path)
 //   If group exceeds limit → spill every row to anonymous disk as it arrives,
@@ -1071,9 +2316,9 @@ pub struct SortMergeJoinOperator<R: Read, W: Write> {
 
     // Right equal-group — disk path
     right_group_on_disk:    bool,
-    right_group_start_block: u64,
     right_group_num_blocks:  u64,
-    right_group_disk_reader: Option<RunReader<R, W>>,
+    right_group_extents: Vec<(u64, u64)>,
+    right_group_disk_reader: Option<SegmentedRunReader<R, W>>,
 }
 
 impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
@@ -1095,18 +2340,11 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
         let mut right_key_idx = Vec::new();
 
         for pred in &predicates {
-            if !matches!(pred.operator, ComparisionOperator::EQ) {
-                anyhow::bail!(
-                    "SortMergeJoin: non-equi predicate on column '{}' — SMJ only supports equi-joins",
-                    pred.column_name
-                );
-            }
+            // Only EQ column=column predicates form SMJ keys; skip everything else.
+            if !matches!(pred.operator, ComparisionOperator::EQ) { continue; }
             let other_col = match &pred.value {
                 ComparisionValue::Column(c) => c,
-                _ => anyhow::bail!(
-                    "SortMergeJoin: predicate on '{}' compares against a literal — SMJ only supports column=column",
-                    pred.column_name
-                ),
+                _ => continue,
             };
 
             // Determine which column is from which side
@@ -1125,10 +2363,7 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
                 right_key_idx.push(ri);
                 continue;
             }
-            anyhow::bail!(
-                "SortMergeJoin: predicate '{} = {}' does not reference one column from each side",
-                pred.column_name, other_col
-            );
+            // Predicate doesn't span the two sides — skip (residual handled by Filter wrapper).
         }
 
         if left_key_idx.is_empty() {
@@ -1143,7 +2378,8 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
             cur_left: None, right_peek: None,
             right_group_ram: Vec::new(), right_group_idx: 0,
             right_group_on_disk: false,
-            right_group_start_block: 0, right_group_num_blocks: 0,
+            right_group_num_blocks: 0,
+            right_group_extents: Vec::new(),
             right_group_disk_reader: None,
         })
     }
@@ -1162,29 +2398,34 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
 
     /// Maximum right-group rows we can hold in RAM without exceeding budget.
     fn max_right_group_rows(&self) -> usize {
-        const PROCESS_OVERHEAD: u64 = 32 * 1024 * 1024;
-        let available = self.memory_limit_bytes.saturating_sub(PROCESS_OVERHEAD) as usize;
-        (available / self.right_row_size()).max(1)
+        // Reserve BATCH_BLOCKS write buffer allocated simultaneously with ram_rows during spill.
+        let write_buf = BATCH_BLOCKS as u64 * self.block_size;
+        let usable = self.memory_limit_bytes
+            .saturating_sub(write_buf) as usize;
+        // Headroom for decode/compare state while probing this group.
+        let budget = usable * 70 / 100;
+        (budget / self.right_row_size()).max(1)
     }
 
-    fn extract_left_key(&self, row: &Row) -> Vec<Data> {
-        self.left_key_idx.iter()
-            .map(|&i| row.get(i).cloned().unwrap_or(Data::Int32(0)))
-            .collect()
-    }
-
-    fn extract_right_key(&self, row: &Row) -> Vec<Data> {
-        self.right_key_idx.iter()
-            .map(|&i| row.get(i).cloned().unwrap_or(Data::Int32(0)))
-            .collect()
-    }
-
-    fn compare_keys(a: &[Data], b: &[Data]) -> std::cmp::Ordering {
-        for (av, bv) in a.iter().zip(b.iter()) {
-            let ord = av.partial_cmp(bv).unwrap_or(std::cmp::Ordering::Equal);
+    /// Compare join-key columns between two rows without allocating.
+    fn compare_rows(row_l: &Row, idx_l: &[usize], row_r: &Row, idx_r: &[usize]) -> std::cmp::Ordering {
+        for (&il, &ir) in idx_l.iter().zip(idx_r.iter()) {
+            let vl = row_l.get(il).unwrap_or(&Data::Int32(0));
+            let vr = row_r.get(ir).unwrap_or(&Data::Int32(0));
+            let ord = vl.partial_cmp(vr).unwrap_or(std::cmp::Ordering::Equal);
             if ord != std::cmp::Ordering::Equal { return ord; }
         }
         std::cmp::Ordering::Equal
+    }
+
+    /// True when `row`'s right key columns all equal the pre-extracted `key` slice.
+    fn row_matches_right_key(row: &Row, right_key_idx: &[usize], key: &[Data]) -> bool {
+        right_key_idx.iter().zip(key.iter()).all(|(&idx, kv)| {
+            row.get(idx)
+                .and_then(|v| v.partial_cmp(kv))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                == std::cmp::Ordering::Equal
+        })
     }
 
     // ------------------------------------------------------------------
@@ -1197,12 +2438,24 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
     /// On overflow, spill ALL accumulated rows (and remaining ones) to disk.
     /// After this call `right_peek` holds the first non-matching right row (or None).
     fn load_right_group(&mut self, first_row: Row) -> Result<()> {
-        let key      = self.extract_right_key(&first_row);
+        // Release the previous group's anonymous disk blocks before overwriting
+        // the tracking fields, so those blocks can be reused by the allocator.
+        if self.right_group_on_disk {
+            for (start, count) in self.right_group_extents.drain(..) {
+                self.anon_allocator.free(start, count);
+            }
+        }
+
+        let key: Vec<Data> = self.right_key_idx.iter()
+            .map(|&i| first_row.get(i).cloned().unwrap_or(Data::Int32(0)))
+            .collect();
         let max_rows = self.max_right_group_rows();
 
         self.right_group_ram.clear();
         self.right_group_idx      = 0;
         self.right_group_on_disk  = false;
+        self.right_group_num_blocks  = 0;
+        self.right_group_extents.clear();
         self.right_group_disk_reader = None;
 
         self.right_group_ram.push(first_row);
@@ -1213,8 +2466,7 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
             match self.right.next()? {
                 None => { self.right_peek = None; return Ok(()); }
                 Some(row) => {
-                    let rk = self.extract_right_key(&row);
-                    if Self::compare_keys(&rk, &key) != std::cmp::Ordering::Equal {
+                    if !Self::row_matches_right_key(&row, &self.right_key_idx, &key) {
                         self.right_peek = Some(row);
                         return Ok(());
                     }
@@ -1223,61 +2475,83 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
             }
         }
 
-        // Phase 2: RAM limit hit — spill everything to disk
+        // Phase 2: RAM limit hit — spill everything to disk in BATCH_BLOCKS batches.
         self.right_group_on_disk = true;
         let ram_rows = std::mem::take(&mut self.right_group_ram);
 
-        let usable          = self.block_size as usize - 2;
-        let mut block_buf   = vec![0u8; self.block_size as usize];
-        let mut buf_offset  = 0usize;
-        let mut rows_in_blk = 0u16;
-        let mut total_blks  = 0u64;
-        let mut first_blk   = 0u64;
-        let mut got_first   = false;
+        let bs     = self.block_size as usize;
+        let usable = bs - 2;
 
-        // Inline flush helper via a labelled block (avoids borrow conflicts)
-        macro_rules! flush_block {
-            () => {{
-                let footer = block_buf.len() - 2;
-                block_buf[footer..].copy_from_slice(&rows_in_blk.to_le_bytes());
-                let id = self.anon_allocator.allocate(1);
-                if !got_first { first_blk = id; got_first = true; }
-                self.disk_access.lock().unwrap().write_blocks(id, 1, &block_buf)?;
-                total_blks += 1;
-                block_buf.fill(0); buf_offset = 0; rows_in_blk = 0;
-            }};
+        let batch_bytes = BATCH_BLOCKS * bs;
+        let mut batch    = vec![0u8; batch_bytes];
+        let mut in_batch = 0usize;
+        let mut total_blks = 0u64;
+
+        let mut block    = vec![0u8; bs];
+        let mut blk_off  = 0usize;
+        let mut rows_blk = 0u16;
+
+        // Seal current block into batch; flush batch to disk when full.
+        macro_rules! maybe_seal_block {
+            ($enc:expr) => {
+                if blk_off + $enc.len() > usable {
+                    let footer = block.len() - 2;
+                    block[footer..].copy_from_slice(&rows_blk.to_le_bytes());
+                    batch[in_batch * bs..(in_batch + 1) * bs].copy_from_slice(&block);
+                    block.fill(0); blk_off = 0; rows_blk = 0;
+                    in_batch += 1;
+                    if in_batch == BATCH_BLOCKS {
+                        let n  = in_batch as u64;
+                        let id = self.anon_allocator.allocate(n);
+                        push_extent(&mut self.right_group_extents, id, n);
+                        self.disk_access.lock().unwrap().write_blocks(id, n, &batch)?;
+                        total_blks += n; in_batch = 0;
+                    }
+                }
+            };
         }
 
         for row in ram_rows {
             let enc = encode_row(&row, &self.right_cols)?;
-            if buf_offset + enc.len() > usable { flush_block!(); }
-            block_buf[buf_offset..buf_offset + enc.len()].copy_from_slice(&enc);
-            buf_offset += enc.len(); rows_in_blk += 1;
+            maybe_seal_block!(enc);
+            block[blk_off..blk_off + enc.len()].copy_from_slice(&enc);
+            blk_off += enc.len(); rows_blk += 1;
         }
 
         loop {
             match self.right.next()? {
                 None => { self.right_peek = None; break; }
                 Some(row) => {
-                    let rk = self.extract_right_key(&row);
-                    if Self::compare_keys(&rk, &key) != std::cmp::Ordering::Equal {
+                    if !Self::row_matches_right_key(&row, &self.right_key_idx, &key) {
                         self.right_peek = Some(row); break;
                     }
                     let enc = encode_row(&row, &self.right_cols)?;
-                    if buf_offset + enc.len() > usable { flush_block!(); }
-                    block_buf[buf_offset..buf_offset + enc.len()].copy_from_slice(&enc);
-                    buf_offset += enc.len(); rows_in_blk += 1;
+                    maybe_seal_block!(enc);
+                    block[blk_off..blk_off + enc.len()].copy_from_slice(&enc);
+                    blk_off += enc.len(); rows_blk += 1;
                 }
             }
         }
 
-        if rows_in_blk > 0 { flush_block!(); }
+        // Seal final partial block and flush remaining batch.
+        if rows_blk > 0 {
+            let footer = block.len() - 2;
+            block[footer..].copy_from_slice(&rows_blk.to_le_bytes());
+            batch[in_batch * bs..(in_batch + 1) * bs].copy_from_slice(&block);
+            in_batch += 1;
+        }
+        if in_batch > 0 {
+            let n  = in_batch as u64;
+            let id = self.anon_allocator.allocate(n);
+            push_extent(&mut self.right_group_extents, id, n);
+            self.disk_access.lock().unwrap().write_blocks(id, n, &batch[..in_batch * bs])?;
+            total_blks += n;
+        }
 
-        self.right_group_start_block = first_blk;
         self.right_group_num_blocks  = total_blks;
-        self.right_group_disk_reader = Some(RunReader::new(
+        self.right_group_disk_reader = Some(SegmentedRunReader::new(
             self.disk_access.clone(), self.right_cols.clone(),
-            self.block_size, first_blk, total_blks,
+            self.block_size, self.right_group_extents.clone(),
         ));
         Ok(())
     }
@@ -1286,10 +2560,9 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
     /// with the same join key).
     fn reset_right_group(&mut self) {
         if self.right_group_on_disk {
-            self.right_group_disk_reader = Some(RunReader::new(
+            self.right_group_disk_reader = Some(SegmentedRunReader::new(
                 self.disk_access.clone(), self.right_cols.clone(),
-                self.block_size,
-                self.right_group_start_block, self.right_group_num_blocks,
+                self.block_size, self.right_group_extents.clone(),
             ));
         } else {
             self.right_group_idx = 0;
@@ -1326,33 +2599,30 @@ impl<R: Read, W: Write> SortMergeJoinOperator<R, W> {
     /// start of an unprocessed group.
     fn advance_to_next_match(&mut self) -> Result<()> {
         loop {
-            let lk = match self.cur_left.as_ref() {
-                None    => { self.done = true; return Ok(()); }
-                Some(r) => self.extract_left_key(r),
-            };
-            let rk = match self.right_peek.as_ref() {
-                None    => { self.done = true; return Ok(()); }
-                Some(r) => self.extract_right_key(r),
-            };
-
-            match Self::compare_keys(&lk, &rk) {
+            if self.cur_left.is_none() || self.right_peek.is_none() {
+                self.done = true;
+                return Ok(());
+            }
+            let left_row  = self.cur_left.as_ref().unwrap();
+            let right_row = self.right_peek.as_ref().unwrap();
+            match Self::compare_rows(left_row, &self.left_key_idx, right_row, &self.right_key_idx) {
                 std::cmp::Ordering::Equal => {
                     let first = self.right_peek.take().unwrap();
                     self.load_right_group(first)?;
                     return Ok(());
                 }
                 std::cmp::Ordering::Less => {
-                    // Left is behind — advance left one row
                     self.cur_left = self.left.next()?;
                 }
                 std::cmp::Ordering::Greater => {
-                    // Right is behind — drain right_peek's entire key group
-                    let skip_key = self.extract_right_key(self.right_peek.as_ref().unwrap());
+                    // Drain right_peek's entire key group without allocating.
+                    let skip_row = self.right_peek.take().unwrap();
                     loop {
                         match self.right.next()? {
                             None => { self.right_peek = None; break; }
                             Some(row) => {
-                                if Self::compare_keys(&self.extract_right_key(&row), &skip_key)
+                                if Self::compare_rows(&skip_row, &self.right_key_idx,
+                                                      &row,      &self.right_key_idx)
                                     != std::cmp::Ordering::Equal
                                 {
                                     self.right_peek = Some(row);
@@ -1396,17 +2666,17 @@ impl<R: Read, W: Write> Operator for SortMergeJoinOperator<R, W> {
                 }
                 None => {
                     // Right group exhausted for current left row — advance left
-                    let cur_key = self.extract_left_key(self.cur_left.as_ref().unwrap());
+                    let prev_left = self.cur_left.take().unwrap();
                     self.cur_left = self.left.next()?;
                     match self.cur_left.as_ref() {
                         None => { self.done = true; return Ok(None); }
                         Some(next) => {
-                            let next_key = self.extract_left_key(next);
-                            if Self::compare_keys(&next_key, &cur_key) == std::cmp::Ordering::Equal {
-                                // Same key — replay the right group
+                            if Self::compare_rows(&prev_left, &self.left_key_idx,
+                                                  next,       &self.left_key_idx)
+                                == std::cmp::Ordering::Equal
+                            {
                                 self.reset_right_group();
                             } else {
-                                // New key — scan forward for next match
                                 self.advance_to_next_match()?;
                                 if self.done { return Ok(None); }
                             }
@@ -1415,6 +2685,17 @@ impl<R: Read, W: Write> Operator for SortMergeJoinOperator<R, W> {
                 }
             }
         }
+    }
+}
+
+impl<R: Read, W: Write> Drop for SortMergeJoinOperator<R, W> {
+    fn drop(&mut self) {
+        if self.right_group_on_disk {
+            for (start, count) in self.right_group_extents.drain(..) {
+                self.anon_allocator.free(start, count);
+            }
+        }
+        self.right_group_num_blocks = 0;
     }
 }
 
@@ -1430,6 +2711,56 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
     memory_limit_bytes: u64,
     anon_allocator: &AnonBlockAllocator,
 ) -> Result<Box<dyn Operator>> {
+    fn build_cross_subtree_with_predicates<R: Read + 'static, W: Write + 'static>(
+        op: &QueryOp,
+        predicates: &[Predicate],
+        catalog: &Catalog,
+        disk_access: Arc<Mutex<DiskAccessLayer<R, W>>>,
+        block_size: u64,
+        memory_limit_bytes: u64,
+        anon_allocator: &AnonBlockAllocator,
+    ) -> Result<Box<dyn Operator>> {
+        match op {
+            QueryOp::Cross(d) => {
+                let left = build_cross_subtree_with_predicates(
+                    &d.left,
+                    predicates,
+                    catalog,
+                    disk_access.clone(),
+                    block_size,
+                    memory_limit_bytes,
+                    anon_allocator,
+                )?;
+                let right = build_cross_subtree_with_predicates(
+                    &d.right,
+                    predicates,
+                    catalog,
+                    disk_access.clone(),
+                    block_size,
+                    memory_limit_bytes,
+                    anon_allocator,
+                )?;
+                Ok(Box::new(CrossOperator::new(
+                    left,
+                    right,
+                    disk_access,
+                    block_size,
+                    10 * memory_limit_bytes,
+                    anon_allocator.clone(),
+                    predicates.to_vec(),
+                )))
+            }
+            _ => build_operator(
+                op,
+                catalog,
+                disk_access,
+                block_size,
+                memory_limit_bytes,
+                anon_allocator,
+            ),
+        }
+    }
+
     match op {
         QueryOp::Scan(d) => {
             let table = catalog.get_table(&d.table_id)
@@ -1438,6 +2769,17 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
         }
 
         QueryOp::Filter(d) => {
+            if let QueryOp::Cross(_) = &*d.underlying {
+                return build_cross_subtree_with_predicates(
+                    &d.underlying,
+                    &d.predicates,
+                    catalog,
+                    disk_access,
+                    block_size,
+                    memory_limit_bytes,
+                    anon_allocator,
+                );
+            }
             let child = build_operator(
                 &d.underlying, catalog, disk_access, block_size, memory_limit_bytes, anon_allocator,
             )?;
@@ -1445,6 +2787,68 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
         }
 
         QueryOp::Project(d) => {
+            if let QueryOp::Scan(sd) = &*d.underlying {
+                let table = catalog.get_table(&sd.table_id)
+                    .ok_or_else(|| anyhow!("Scan: table '{}' not found", sd.table_id))?;
+                // Collect unique source column names referenced by the projection.
+                let mut needed: Vec<String> = Vec::new();
+                for (from, _) in &d.column_name_map {
+                    if !needed.iter().any(|c| c == from) {
+                        needed.push(from.clone());
+                    }
+                }
+                // Only take the projected-decode fast path when every `from`
+                // is a real column of this table. Otherwise fall through to
+                // the standard Scan + ProjectOperator path so the original
+                // (full-decode) name resolution / error message applies.
+                let all_resolved = needed.iter().all(|n|
+                    table.columns().iter().any(|c| c.name == *n));
+                if all_resolved {
+                    let scan = ScanOperator::new_projected(disk_access, table, block_size, &needed)?;
+                    return Ok(Box::new(ProjectOperator::new(Box::new(scan), d.column_name_map.clone())?));
+                }
+            }
+
+            if let QueryOp::Sort(s) = &*d.underlying {
+                let mut needed: Vec<String> = Vec::new();
+                for (from, _) in &d.column_name_map {
+                    if !needed.iter().any(|c| c == from) {
+                        needed.push(from.clone());
+                    }
+                }
+                for spec in &s.sort_specs {
+                    if !needed.iter().any(|c| c == &spec.column_name) {
+                        needed.push(spec.column_name.clone());
+                    }
+                }
+
+                let child = build_operator(
+                    &s.underlying,
+                    catalog,
+                    disk_access.clone(),
+                    block_size,
+                    memory_limit_bytes,
+                    anon_allocator,
+                )?;
+
+                let identity_map: Vec<(String, String)> = needed
+                    .into_iter()
+                    .map(|name| (name.clone(), name))
+                    .collect();
+                let narrowed_child: Box<dyn Operator> = Box::new(ProjectOperator::new(child, identity_map)?);
+
+                let sort_op: Box<dyn Operator> = Box::new(SortOperator::new(
+                    narrowed_child,
+                    s.sort_specs.clone(),
+                    disk_access,
+                    block_size,
+                    3 * memory_limit_bytes,
+                    anon_allocator.clone(),
+                ));
+
+                return Ok(Box::new(ProjectOperator::new(sort_op, d.column_name_map.clone())?));
+            }
+
             let child = build_operator(
                 &d.underlying, catalog, disk_access, block_size, memory_limit_bytes, anon_allocator,
             )?;
@@ -1457,7 +2861,7 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
             )?;
             Ok(Box::new(SortOperator::new(
                 child, d.sort_specs.clone(),
-                disk_access, block_size, memory_limit_bytes,
+                disk_access, block_size, 3 * memory_limit_bytes,
                 anon_allocator.clone(),
             )))
         }
@@ -1465,17 +2869,17 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
         QueryOp::Cross(d) => {
             let left  = build_operator(&d.left,  catalog, disk_access.clone(), block_size, memory_limit_bytes, anon_allocator)?;
             let right = build_operator(&d.right, catalog, disk_access.clone(), block_size, memory_limit_bytes, anon_allocator)?;
-            Ok(Box::new(CrossOperator::new(left, right, disk_access, block_size, memory_limit_bytes, anon_allocator.clone(), vec![])))
+            Ok(Box::new(CrossOperator::new(left, right, disk_access, block_size, 10 * memory_limit_bytes, anon_allocator.clone(), vec![])))
         }
 
         QueryOp::Join(d) => {
             let left  = build_operator(&d.left,  catalog, disk_access.clone(), block_size, memory_limit_bytes, anon_allocator)?;
             let right = build_operator(&d.right, catalog, disk_access.clone(), block_size, memory_limit_bytes, anon_allocator)?;
             match d.algorithm {
-                JoinAlgorithm::BNlj =>
-                    Ok(Box::new(CrossOperator::new(left, right, disk_access, block_size, memory_limit_bytes, anon_allocator.clone(), d.predicates.clone()))),
                 JoinAlgorithm::SortMerge =>
-                    Ok(Box::new(SortMergeJoinOperator::new(left, right, disk_access, block_size, memory_limit_bytes, anon_allocator.clone(), d.predicates.clone())?)),
+                    Ok(Box::new(SortMergeJoinOperator::new(left, right, disk_access, block_size, 10 * memory_limit_bytes, anon_allocator.clone(), d.predicates.clone())?)),
+                JoinAlgorithm::HashJoin =>
+                    Ok(Box::new(HashJoinOperator::new(left, right, disk_access, block_size, 10 * memory_limit_bytes, anon_allocator.clone(), d.predicates.clone())?)),
             }
         }
     }

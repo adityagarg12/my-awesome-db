@@ -51,13 +51,13 @@ pub struct CrossData {
 }
 
 /// Which physical join algorithm to use for a Join node.
-/// Set by the optimizer; defaults to BNlj.
+/// Set by the optimizer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum JoinAlgorithm {
-    /// Block Nested-Loop Join — right side spilled to disk, left chunked in RAM.
-    BNlj,
     /// Sort-Merge Join — both inputs must arrive pre-sorted on the join key.
     SortMerge,
+    /// Grace Hash Join — hash partition both inputs, then probe partition pairs.
+    HashJoin,
 }
 
 /// Optimizer-internal node: never appears in the input query tree.
@@ -92,7 +92,7 @@ pub enum QueryOp {
     Cross(CrossData),
     Sort(SortData),
     Scan(ScanData),
-    /// Optimizer-internal: B-NLJ join with pushed-down predicates.
+    /// Optimizer-internal join with pushed-down predicates.
     /// Never present in the input query; produced by the optimizer.
     Join(JoinData),
 }
